@@ -1,0 +1,31 @@
+{
+  "name": "pi-scheduler",
+  "version": "0.1.0",
+  "description": "Give Pi coding agents a clock: schedule reminders, shell commands, and self-waking prompts for CI polling and autonomous follow-ups.",
+  "keywords": [
+    "pi-package",
+    "pi-agent",
+    "coding-agent",
+    "ai-agents",
+    "scheduler",
+    "automation",
+    "reminders",
+    "ci-cd",
+    "developer-tools",
+    "typescript"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/scheduler/index.ts"
+    ]
+  }
+}
