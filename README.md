@@ -205,9 +205,7 @@ Prompt priority:
 2. `failurePrompt` on failure
 3. `followUpPrompt` fallback
 
-## How this differs from `pi-schedule-prompt`
-
-[`pi-schedule-prompt`](https://github.com/tintinweb/pi-schedule-prompt) is a mature prompt scheduler with a richer prompt-focused UI and optional per-task model/subagent mode.
+## Design focus
 
 Pi Scheduler focuses on **scheduled actions**:
 
@@ -217,7 +215,7 @@ Pi Scheduler focuses on **scheduled actions**:
 - bounded command polling with `maxRuns`
 - prompt/notify/message actions as lightweight companions
 
-If you mainly want recurring prompts and a full jobs overlay, `pi-schedule-prompt` may be the better fit. If you want delayed or recurring command execution with result-aware follow-up, use Pi Scheduler.
+The goal is to make command-driven automation simple: schedule the check, capture the result, and wake the agent only when useful.
 
 ## Important limitations
 
