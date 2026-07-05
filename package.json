@@ -1,6 +1,6 @@
 {
   "name": "@jl1990/pi-scheduler",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Give Pi coding agents a clock: schedule reminders, shell commands, and self-waking prompts for CI polling and autonomous follow-ups.",
   "author": "jl1990",
   "license": "MIT",
