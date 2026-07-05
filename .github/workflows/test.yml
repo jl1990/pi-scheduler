@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Validate package metadata
+        run: npm install --package-lock=false --ignore-scripts
+      - name: Run tests
+        run: npm test
+      - name: Check npm package contents
+        run: npm pack --dry-run

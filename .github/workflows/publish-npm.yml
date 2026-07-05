@@ -1,0 +1,53 @@
+name: Publish npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run npm publish with --dry-run instead of publishing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Validate package metadata
+        run: npm install --package-lock=false --ignore-scripts
+      - name: Run tests
+        run: npm test
+      - name: Check npm package contents
+        run: npm pack --dry-run
+      - name: Prepare npm auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # setup-node writes an npmrc auth-token placeholder. Keep it when
+          # NPM_TOKEN is configured; remove it when using npm Trusted Publishing
+          # so npm can use GitHub OIDC instead.
+          if [ -z "${NODE_AUTH_TOKEN:-}" ] && [ -n "${NPM_CONFIG_USERCONFIG:-}" ]; then
+            sed -i.bak '/:_authToken/d' "$NPM_CONFIG_USERCONFIG" || true
+          fi
+      - name: Publish dry run
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: npm publish --dry-run --access public
+      - name: Publish to npm
+        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

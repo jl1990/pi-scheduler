@@ -28,16 +28,16 @@ Without scheduling, the agent has to stop and hope you come back. With Pi Schedu
 
 ## Install
 
-Install directly from GitHub:
+Install from npm:
+
+```bash
+pi install npm:@jl1990/pi-scheduler
+```
+
+Or install directly from GitHub:
 
 ```bash
 pi install git:git@github.com:jl1990/pi-scheduler.git
-```
-
-Or with HTTPS:
-
-```bash
-pi install https://github.com/jl1990/pi-scheduler
 ```
 
 Then restart Pi, or run:
@@ -142,6 +142,12 @@ Run tests:
 npm test
 ```
 
+Check what will be published to npm:
+
+```bash
+npm pack --dry-run
+```
+
 Load-check the extension locally:
 
 ```bash
@@ -153,6 +159,30 @@ Try a command without starting a model turn:
 ```bash
 PI_OFFLINE=1 pi --no-extensions -e ./extensions/scheduler/index.ts --no-session --mode json -p "/schedules"
 ```
+
+## Publishing
+
+This package is published as:
+
+```text
+@jl1990/pi-scheduler
+```
+
+The GitHub Actions workflow `.github/workflows/publish-npm.yml` publishes to npm when a GitHub Release is published. It also supports manual runs from the Actions tab, including a dry-run option.
+
+Before the first automated publish, configure one of these npm auth methods:
+
+1. **Trusted publishing** on npm, for repository `jl1990/pi-scheduler` and workflow `publish-npm.yml`.
+2. Or a GitHub repository secret named `NPM_TOKEN` with publish permission.
+
+Release flow:
+
+```bash
+npm version patch   # or minor/major
+git push --follow-tags
+```
+
+Then create/publish a GitHub Release for the new tag. The workflow will run tests, check package contents, and publish with npm provenance.
 
 ## Security notes
 
