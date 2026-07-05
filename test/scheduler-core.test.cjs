@@ -3,19 +3,29 @@ const assert = require("node:assert/strict");
 
 const {
 	parseWhen,
+	parseDurationMs,
+	validateTaskSchedule,
 	splitScheduleCommand,
 	createScheduledTask,
 	cancelScheduledTask,
-	markScheduledTaskFired,
+	enableScheduledTask,
+	disableScheduledTask,
+	removeScheduledTask,
+	updateScheduledTask,
+	markScheduledTaskRunning,
+	markScheduledTaskCompleted,
+	markScheduledTaskFailed,
 	formatTaskList,
 	pendingTasks,
 	dueTasks,
+	sanitizeTasks,
+	shouldWakeForShellResult,
 } = require("../extensions/scheduler/scheduler-core.cjs");
 
 const NOW = new Date(2026, 6, 5, 12, 0, 0, 0);
 
-function ms(minutes) {
-	return minutes * 60 * 1000;
+function minutes(value) {
+	return value * 60 * 1000;
 }
 
 function localAt(daysFromNow, hour, minute = 0) {
@@ -26,10 +36,11 @@ function localAt(daysFromNow, hour, minute = 0) {
 }
 
 test("parseWhen handles relative durations", () => {
-	assert.equal(parseWhen("5m", NOW).dueAtMs, NOW.getTime() + ms(5));
-	assert.equal(parseWhen("in 5 minutes", NOW).dueAtMs, NOW.getTime() + ms(5));
-	assert.equal(parseWhen("1h30m", NOW).dueAtMs, NOW.getTime() + ms(90));
-	assert.equal(parseWhen("2 days", NOW).dueAtMs, NOW.getTime() + ms(2 * 24 * 60));
+	assert.equal(parseWhen("5m", NOW).dueAtMs, NOW.getTime() + minutes(5));
+	assert.equal(parseWhen("+5m", NOW).dueAtMs, NOW.getTime() + minutes(5));
+	assert.equal(parseWhen("in 5 minutes", NOW).dueAtMs, NOW.getTime() + minutes(5));
+	assert.equal(parseWhen("1h30m", NOW).dueAtMs, NOW.getTime() + minutes(90));
+	assert.equal(parseWhen("2 days", NOW).dueAtMs, NOW.getTime() + minutes(2 * 24 * 60));
 });
 
 test("parseWhen handles clock times", () => {
@@ -43,53 +54,121 @@ test("parseWhen rejects invalid or past inputs", () => {
 	assert.throws(() => parseWhen("2020-01-01T00:00:00Z", NOW), /past/);
 });
 
-test("splitScheduleCommand separates optional action, when, and payload", () => {
+test("validateTaskSchedule supports once, interval, and cron", () => {
+	const once = validateTaskSchedule("once", "5m", NOW);
+	assert.equal(once.type, "once");
+	assert.equal(Date.parse(once.nextRun), NOW.getTime() + minutes(5));
+
+	const interval = validateTaskSchedule("interval", "10m", NOW);
+	assert.equal(interval.type, "interval");
+	assert.equal(interval.intervalMs, minutes(10));
+	assert.equal(Date.parse(interval.nextRun), NOW.getTime() + minutes(10));
+
+	const cron = validateTaskSchedule("cron", "0 */5 * * * *", NOW);
+	assert.equal(cron.type, "cron");
+	assert.ok(Date.parse(cron.nextRun) > NOW.getTime());
+	assert.throws(() => validateTaskSchedule("cron", "not cron", NOW), /Invalid cron/);
+	assert.throws(() => validateTaskSchedule("interval", "tomorrow", NOW), /Invalid interval/);
+});
+
+test("splitScheduleCommand separates optional action, type, schedule, and payload", () => {
 	assert.deepEqual(splitScheduleCommand("in 5 minutes stretch", NOW), {
 		action: "notify",
+		type: "once",
+		schedule: "in 5 minutes",
 		whenText: "in 5 minutes",
 		payload: "stretch",
 	});
 	assert.deepEqual(splitScheduleCommand("prompt 5m summarize this session", NOW), {
 		action: "prompt",
+		type: "once",
+		schedule: "5m",
 		whenText: "5m",
 		payload: "summarize this session",
 	});
 	assert.deepEqual(splitScheduleCommand("shell at 14:30 npm test", NOW), {
 		action: "shell",
+		type: "once",
+		schedule: "at 14:30",
 		whenText: "at 14:30",
 		payload: "npm test",
 	});
 	assert.deepEqual(splitScheduleCommand("prompt tomorrow at 9am check build", NOW), {
 		action: "prompt",
+		type: "once",
+		schedule: "tomorrow at 9am",
 		whenText: "tomorrow at 9am",
 		payload: "check build",
 	});
 });
 
-test("splitScheduleCommand supports :: separators for complex payloads", () => {
+test("splitScheduleCommand supports :: separators and recurring syntax", () => {
 	assert.deepEqual(splitScheduleCommand("shell in 10m :: echo 'hello world' && date", NOW), {
 		action: "shell",
+		type: "once",
+		schedule: "in 10m",
 		whenText: "in 10m",
 		payload: "echo 'hello world' && date",
 	});
 	assert.deepEqual(splitScheduleCommand("2026-07-06T10:00:00 :: absolute default notify", NOW), {
 		action: "notify",
+		type: "once",
+		schedule: "2026-07-06T10:00:00",
 		whenText: "2026-07-06T10:00:00",
 		payload: "absolute default notify",
 	});
+	assert.deepEqual(splitScheduleCommand("shell every 5m :: date", NOW), {
+		action: "shell",
+		type: "interval",
+		schedule: "5m",
+		whenText: "5m",
+		payload: "date",
+	});
+	assert.deepEqual(splitScheduleCommand("prompt interval 10m :: check pipeline", NOW), {
+		action: "prompt",
+		type: "interval",
+		schedule: "10m",
+		whenText: "10m",
+		payload: "check pipeline",
+	});
+	assert.deepEqual(splitScheduleCommand("prompt cron 0 */5 * * * * :: check pipeline", NOW), {
+		action: "prompt",
+		type: "cron",
+		schedule: "0 */5 * * * *",
+		whenText: "0 */5 * * * *",
+		payload: "check pipeline",
+	});
 });
 
-test("createScheduledTask validates action payloads", () => {
+test("createScheduledTask validates action payloads and task metadata", () => {
 	const notify = createScheduledTask(
-		{ action: "notify", whenText: "5m", message: "Take a break", cwd: "/tmp/project" },
+		{
+			action: "notify",
+			whenText: "5m",
+			message: "Take a break",
+			cwd: "/tmp/project",
+			name: "break",
+			description: "Human reminder",
+			scope: "cwd",
+			maxRuns: 3,
+		},
 		NOW,
 		() => "task_notify",
 	);
 	assert.equal(notify.id, "task_notify");
 	assert.equal(notify.status, "pending");
+	assert.equal(notify.enabled, true);
+	assert.equal(notify.type, "once");
+	assert.equal(notify.schedule, "5m");
 	assert.equal(notify.action, "notify");
 	assert.equal(notify.message, "Take a break");
-	assert.equal(new Date(notify.dueAt).getTime(), NOW.getTime() + ms(5));
+	assert.equal(notify.name, "break");
+	assert.equal(notify.description, "Human reminder");
+	assert.equal(notify.scope, "cwd");
+	assert.equal(notify.maxRuns, 3);
+	assert.equal(notify.runCount, 0);
+	assert.equal(Date.parse(notify.dueAt), NOW.getTime() + minutes(5));
+	assert.equal(notify.nextRun, notify.dueAt);
 	assert.equal(notify.cwd, "/tmp/project");
 
 	const prompt = createScheduledTask(
@@ -102,51 +181,129 @@ test("createScheduledTask validates action payloads", () => {
 	const shell = createScheduledTask(
 		{
 			action: "shell",
-			whenText: "15m",
+			type: "interval",
+			schedule: "15m",
 			command: "npm test",
 			timeoutMs: 1000,
 			followUpPrompt: "Review the test result and decide next steps.",
+			successPrompt: "Celebrate success.",
+			failurePrompt: "Debug the failure.",
+			wakeOn: "failure",
 		},
 		NOW,
 		() => "task_shell",
 	);
 	assert.equal(shell.command, "npm test");
+	assert.equal(shell.type, "interval");
+	assert.equal(shell.intervalMs, minutes(15));
 	assert.equal(shell.timeoutMs, 1000);
 	assert.equal(shell.followUpPrompt, "Review the test result and decide next steps.");
+	assert.equal(shell.successPrompt, "Celebrate success.");
+	assert.equal(shell.failurePrompt, "Debug the failure.");
+	assert.equal(shell.wakeOn, "failure");
 
 	assert.throws(() => createScheduledTask({ action: "prompt", whenText: "5m" }, NOW), /prompt is required/);
 	assert.throws(() => createScheduledTask({ action: "shell", whenText: "5m" }, NOW), /command is required/);
+	assert.throws(() => createScheduledTask({ action: "notify", whenText: "5m", message: "x", maxRuns: 0 }, NOW), /maxRuns/);
 });
 
-test("task lifecycle helpers update pending tasks", () => {
+test("sanitizeTasks migrates current one-shot task records", () => {
+	const legacy = {
+		id: "legacy",
+		action: "notify",
+		status: "pending",
+		createdAt: NOW.toISOString(),
+		dueAt: new Date(NOW.getTime() + minutes(5)).toISOString(),
+		whenText: "5m",
+		message: "legacy reminder",
+	};
+
+	const [task] = sanitizeTasks([legacy]);
+	assert.equal(task.id, "legacy");
+	assert.equal(task.type, "once");
+	assert.equal(task.enabled, true);
+	assert.equal(task.runCount, 0);
+	assert.equal(task.schedule, "5m");
+	assert.equal(task.nextRun, legacy.dueAt);
+});
+
+test("task lifecycle helpers update enabled state and recurrence metadata", () => {
 	const tasks = [
 		createScheduledTask({ action: "notify", whenText: "5m", message: "A" }, NOW, () => "a"),
-		createScheduledTask({ action: "prompt", whenText: "10m", prompt: "B" }, NOW, () => "b"),
+		createScheduledTask({ action: "prompt", type: "interval", schedule: "10m", prompt: "B", maxRuns: 1 }, NOW, () => "b"),
 	];
 
 	assert.deepEqual(pendingTasks(tasks).map((t) => t.id), ["a", "b"]);
-	assert.deepEqual(dueTasks(tasks, new Date(NOW.getTime() + ms(6))).map((t) => t.id), ["a"]);
+	assert.deepEqual(dueTasks(tasks, new Date(NOW.getTime() + minutes(6))).map((t) => t.id), ["a"]);
 
-	const cancelled = cancelScheduledTask(tasks, "b", NOW);
-	assert.equal(cancelled.id, "b");
-	assert.equal(tasks[1].status, "cancelled");
-	assert.equal(typeof tasks[1].cancelledAt, "string");
+	const disabled = disableScheduledTask(tasks, "b", NOW);
+	assert.equal(disabled.enabled, false);
+	assert.deepEqual(pendingTasks(tasks).map((t) => t.id), ["a"]);
 
-	const fired = markScheduledTaskFired(tasks, "a", NOW, { ok: true });
-	assert.equal(fired.status, "fired");
-	assert.deepEqual(fired.result, { ok: true });
+	const enabled = enableScheduledTask(tasks, "b", NOW);
+	assert.equal(enabled.enabled, true);
+	assert.equal(enabled.status, "pending");
+
+	const updated = updateScheduledTask(tasks, "b", { schedule: "15m", name: "poll" }, NOW);
+	assert.equal(updated.name, "poll");
+	assert.equal(updated.intervalMs, minutes(15));
+
+	const running = markScheduledTaskRunning(tasks, "b", NOW);
+	assert.equal(running.status, "running");
+	assert.equal(running.lastStatus, "running");
+
+	const completed = markScheduledTaskCompleted(tasks, "b", NOW, { ok: true }, { ok: true });
+	assert.equal(completed.runCount, 1);
+	assert.equal(completed.lastStatus, "success");
+	assert.equal(completed.enabled, false);
+	assert.equal(completed.status, "fired");
+	assert.deepEqual(completed.result, { ok: true });
+
+	const cancelled = cancelScheduledTask(tasks, "a", NOW);
+	assert.equal(cancelled.id, "a");
+	assert.equal(cancelled.status, "cancelled");
+	assert.equal(cancelled.enabled, false);
+	assert.equal(typeof cancelled.cancelledAt, "string");
+
 	assert.throws(() => cancelScheduledTask(tasks, "missing", NOW), /not found/);
+	assert.equal(removeScheduledTask(tasks, "a").id, "a");
+	assert.equal(tasks.some((task) => task.id === "a"), false);
 });
 
-test("formatTaskList is readable and sorted by due time", () => {
+test("failed recurring runs stay scheduled unless maxRuns is reached", () => {
 	const tasks = [
-		createScheduledTask({ action: "prompt", whenText: "10m", prompt: "B" }, NOW, () => "b"),
-		createScheduledTask({ action: "notify", whenText: "5m", message: "A" }, NOW, () => "a"),
+		createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "false" }, NOW, () => "shell"),
+	];
+	markScheduledTaskRunning(tasks, "shell", NOW);
+	const failed = markScheduledTaskFailed(tasks, "shell", NOW, new Error("boom"));
+	assert.equal(failed.enabled, true);
+	assert.equal(failed.status, "pending");
+	assert.equal(failed.lastStatus, "error");
+	assert.equal(failed.lastError, "boom");
+	assert.equal(failed.runCount, 1);
+});
+
+test("shell wakeOn helper matches success and failure conditions", () => {
+	assert.equal(shouldWakeForShellResult({ wakeOn: "never", followUpPrompt: "x" }, { ok: false }), false);
+	assert.equal(shouldWakeForShellResult({ wakeOn: "success", followUpPrompt: "x" }, { ok: true }), true);
+	assert.equal(shouldWakeForShellResult({ wakeOn: "success", followUpPrompt: "x" }, { ok: false }), false);
+	assert.equal(shouldWakeForShellResult({ wakeOn: "failure", followUpPrompt: "x" }, { ok: false }), true);
+	assert.equal(shouldWakeForShellResult({ followUpPrompt: "x" }, { ok: true }), true);
+	assert.equal(shouldWakeForShellResult({}, { ok: false }), false);
+});
+
+test("formatTaskList is readable and sorted by next run", () => {
+	const tasks = [
+		createScheduledTask({ action: "prompt", type: "interval", schedule: "10m", prompt: "B", name: "poll" }, NOW, () => "b"),
+		createScheduledTask({ action: "notify", whenText: "5m", message: "A", name: "break" }, NOW, () => "a"),
 	];
 	const output = formatTaskList(tasks, NOW);
 	assert.match(output, /a/);
+	assert.match(output, /break/);
 	assert.match(output, /A/);
 	assert.match(output, /b/);
-	assert.match(output, /prompt/);
-	assert.ok(output.indexOf("A") < output.indexOf("B"));
+	assert.match(output, /poll/);
+	assert.match(output, /interval/);
+	assert.match(output, /runs=0/);
+	assert.ok(output.indexOf("break") < output.indexOf("poll"));
 });

@@ -61,5 +61,8 @@
     "typebox": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "croner": "10.0.1"
   }
 }
