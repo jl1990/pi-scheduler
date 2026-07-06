@@ -1,4 +1,21 @@
-const { Cron } = require("croner");
+const { realpathSync } = require("node:fs");
+const { createRequire } = require("node:module");
+
+function loadCroner() {
+	try {
+		return require("croner");
+	} catch (error) {
+		if (error?.code !== "MODULE_NOT_FOUND" || !String(error?.message ?? "").includes("'croner'")) {
+			throw error;
+		}
+		// Pi's extension loader can preserve the npm/pnpm package symlink path. In that
+		// mode Node does not walk up into pnpm's real virtual-store node_modules, so
+		// resolve from this file's real path as a fallback.
+		return createRequire(realpathSync(__filename))("croner");
+	}
+}
+
+const { Cron } = loadCroner();
 
 const VALID_ACTIONS = new Set(["notify", "prompt", "shell", "message"]);
 const VALID_TYPES = new Set(["once", "interval", "cron"]);

@@ -1,5 +1,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
+const { mkdirSync, mkdtempSync, rmSync, symlinkSync } = require("node:fs");
+const { tmpdir } = require("node:os");
+const { dirname, join, resolve } = require("node:path");
 
 const {
 	parseWhen,
@@ -69,6 +73,29 @@ test("validateTaskSchedule supports once, interval, and cron", () => {
 	assert.ok(Date.parse(cron.nextRun) > NOW.getTime());
 	assert.throws(() => validateTaskSchedule("cron", "not cron", NOW), /Invalid cron/);
 	assert.throws(() => validateTaskSchedule("interval", "tomorrow", NOW), /Invalid interval/);
+});
+
+test("scheduler core resolves croner when loaded through a preserved symlink", () => {
+	const tmp = mkdtempSync(join(tmpdir(), "pi-scheduler-preserve-symlink-"));
+	try {
+		const linkedCore = join(tmp, "node_modules", "@jl1990", "pi-scheduler", "extensions", "scheduler", "scheduler-core.cjs");
+		mkdirSync(dirname(linkedCore), { recursive: true });
+		symlinkSync(resolve(__dirname, "..", "extensions", "scheduler", "scheduler-core.cjs"), linkedCore);
+
+		const script = [
+			`const core = require(${JSON.stringify(linkedCore)});`,
+			`const result = core.validateTaskSchedule("cron", "0 */5 * * * *", new Date("2026-07-05T12:00:00Z"));`,
+			`console.log(result.type);`,
+		].join("\n");
+		const result = spawnSync(process.execPath, ["--preserve-symlinks", "-e", script], {
+			encoding: "utf8",
+		});
+
+		assert.equal(result.status, 0, result.stderr || result.stdout);
+		assert.match(result.stdout, /cron/);
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
+	}
 });
 
 test("splitScheduleCommand separates optional action, type, schedule, and payload", () => {
