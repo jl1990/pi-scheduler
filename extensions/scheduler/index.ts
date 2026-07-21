@@ -170,9 +170,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 		const lines = ["⏰ Scheduled Actions"];
 		for (const task of upcoming) {
-			const next = task.nextRun ? core.formatRelativeTime(task.nextRun) : "no next run";
+			const relative = task.nextRun ? core.formatRelativeTime(task.nextRun) : "no next run";
+			const absolute = task.nextRun ? core.formatAbsoluteTime(task.nextRun) : "";
+			const when = absolute ? `${relative} (${absolute})` : relative;
 			const last = task.lastStatus ? ` last=${task.lastStatus}` : "";
-			lines.push(`  ✓ ${taskLabel(task)} ${task.action}/${task.type} ${next} runs=${task.runCount ?? 0}${last}`);
+			lines.push(`  ✓ ${taskLabel(task)} ${task.action}/${task.type} ${when} runs=${task.runCount ?? 0}${last}`);
 		}
 		ctx.ui.setWidget("scheduler", lines, { placement: "belowEditor" });
 	}

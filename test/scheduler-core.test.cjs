@@ -24,6 +24,7 @@ const {
 	dueTasks,
 	sanitizeTasks,
 	shouldWakeForShellResult,
+	formatAbsoluteTime,
 } = require("../extensions/scheduler/scheduler-core.cjs");
 
 const NOW = new Date(2026, 6, 5, 12, 0, 0, 0);
@@ -333,4 +334,27 @@ test("formatTaskList is readable and sorted by next run", () => {
 	assert.match(output, /interval/);
 	assert.match(output, /runs=0/);
 	assert.ok(output.indexOf("break") < output.indexOf("poll"));
+});
+
+test("formatAbsoluteTime shows same-day 24h time with at prefix", () => {
+	const todayAfternoon = new Date(NOW.getTime() + 3 * 60 * 60 * 1000); // +3h = same day
+	const result = formatAbsoluteTime(todayAfternoon.toISOString(), NOW);
+	assert.match(result, /^at \d{2}:\d{2}$/);
+	assert.doesNotMatch(result, /AM|PM/i);
+});
+
+test("formatAbsoluteTime shows tomorrow prefix for next day", () => {
+	const nextDay = new Date(NOW.getTime() + 24 * 60 * 60 * 1000); // +1 day
+	const result = formatAbsoluteTime(nextDay.toISOString(), NOW);
+	assert.match(result, /^tomorrow at /);
+});
+
+test("formatAbsoluteTime shows on date prefix for beyond tomorrow", () => {
+	const later = new Date(NOW.getTime() + 5 * 24 * 60 * 60 * 1000); // +5 days
+	const result = formatAbsoluteTime(later.toISOString(), NOW);
+	assert.match(result, /^on [A-Z][a-z]{2} \d+ at /);
+});
+
+test("formatAbsoluteTime returns unknown for invalid date", () => {
+	assert.equal(formatAbsoluteTime("garbage", NOW), "unknown");
 });

@@ -670,6 +670,24 @@ function formatRelativeTime(dueAt, nowValue = new Date()) {
 	return `in ${parts.join(" ") || "<1s"}`;
 }
 
+function formatAbsoluteTime(nextRun, nowValue = new Date()) {
+	const date = new Date(nextRun);
+	if (!Number.isFinite(date.getTime())) return "unknown";
+	const now = asDate(nowValue);
+	const tomorrow = new Date(now);
+	tomorrow.setDate(tomorrow.getDate() + 1);
+
+	const timeStr = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+
+	if (date.toDateString() === now.toDateString()) {
+		return `at ${timeStr}`;
+	}
+	if (date.toDateString() === tomorrow.toDateString()) {
+		return `tomorrow at ${timeStr}`;
+	}
+	return `on ${date.toLocaleDateString([], { month: "short", day: "numeric" })} at ${timeStr}`;
+}
+
 function formatSchedule(task) {
 	if (task.type === "interval") return `every ${task.schedule}`;
 	if (task.type === "cron") return `cron ${task.schedule}`;
@@ -726,6 +744,7 @@ module.exports = {
 	markScheduledTaskFailed,
 	shouldWakeForShellResult,
 	selectShellFollowUpPrompt,
+	formatAbsoluteTime,
 	formatRelativeTime,
 	formatTaskLine,
 	formatTaskList,
