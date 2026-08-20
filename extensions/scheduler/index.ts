@@ -223,6 +223,50 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		handles.set(task.id, { kind: "timeout", handle: timer });
 	}
 
+	// ── Catch up missed tasks after crash/exit (with guards) ─────────────
+	// Configurable via env vars:
+	//   PI_SCHEDULER_CATCHUP_WINDOW_H  — how many hours back to look   (default: 24)
+	//   PI_SCHEDULER_CATCHUP_MAX       — max tasks to fire per startup  (default: 5)
+	const CATCHUP_MAX_OVERDUE_MS =
+		Number(process.env.PI_SCHEDULER_CATCHUP_WINDOW_H ?? 24) * 3600 * 1000;
+	const CATCHUP_MAX_FIRE =
+		Number(process.env.PI_SCHEDULER_CATCHUP_MAX ?? 5);
+	let catchUpRunning = false;
+
+	async function catchUpOverdueTasks(ctx: ExtensionContext): Promise<void> {
+		if (catchUpRunning) return;
+		catchUpRunning = true;
+		try {
+			const now = Date.now();
+			const overdue = core
+				.pendingTasks(tasks)
+				.filter((t) => taskBelongsToSession(t, ctx))
+				.filter((t) => t.enabled !== false)                      // skip disabled tasks
+				.map((t) => ({ task: t, next: Date.parse(t.nextRun ?? t.dueAt ?? "") }))
+				.filter((x) => !Number.isNaN(x.next))                   // must have a valid next time
+				.filter((x) => x.next <= now)                           // already overdue
+				.filter((x) => now - x.next <= CATCHUP_MAX_OVERDUE_MS)  // within window
+				.sort((a, b) => b.next - a.next)                        // most recent missed first
+				.slice(0, CATCHUP_MAX_FIRE);                            // cap
+			if (overdue.length === 0) return;
+			if (ctx.ui?.notify) {
+				ctx.ui.notify(
+					`Catching up ${overdue.length} missed task(s) (missed ≤${process.env.PI_SCHEDULER_CATCHUP_WINDOW_H ?? 24} h, limit ${CATCHUP_MAX_FIRE})`,
+					"info",
+				);
+			}
+			for (const { task } of overdue) {
+				try {                                                    // isolate per-task failures
+					await fireTask(task.id, ctx);
+				} catch {
+					// one task failing must not block the remaining catch-up
+				}
+			}
+		} finally {
+			catchUpRunning = false;
+		}
+	}
+
 	function rescheduleAll(ctx = activeCtx): void {
 		if (!ctx) return;
 		clearTimers();
@@ -387,6 +431,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		activeCtx = ctx;
 		await loadTasks();
 		rescheduleAll(ctx);
+		void catchUpOverdueTasks(ctx); // added: fire missed tasks on startup
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
