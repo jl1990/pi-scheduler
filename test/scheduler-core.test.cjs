@@ -23,6 +23,10 @@ const {
 	pendingTasks,
 	dueTasks,
 	sanitizeTasks,
+	parseCatchUpOptions,
+	selectCatchUpCronTasks,
+	recoverInterruptedTasks,
+	taskMatchesScope,
 	shouldWakeForShellResult,
 	formatAbsoluteTime,
 } = require("../extensions/scheduler/scheduler-core.cjs");
@@ -253,6 +257,7 @@ test("sanitizeTasks migrates current one-shot task records", () => {
 	assert.equal(task.runCount, 0);
 	assert.equal(task.schedule, "5m");
 	assert.equal(task.nextRun, legacy.dueAt);
+	assert.equal(task.scope, "global");
 });
 
 test("task lifecycle helpers update enabled state and recurrence metadata", () => {
@@ -275,6 +280,13 @@ test("task lifecycle helpers update enabled state and recurrence metadata", () =
 	const updated = updateScheduledTask(tasks, "b", { schedule: "15m", name: "poll" }, NOW);
 	assert.equal(updated.name, "poll");
 	assert.equal(updated.intervalMs, minutes(15));
+	updateScheduledTask(tasks, "b", { scope: "session", sessionFile: "/sessions/current.jsonl" }, NOW);
+	assert.equal(updated.scope, "session");
+	assert.equal(updated.sessionFile, "/sessions/current.jsonl");
+	updateScheduledTask(tasks, "b", { scope: "cwd", sessionFile: null, cwd: "/work/project" }, NOW);
+	assert.equal(updated.scope, "cwd");
+	assert.equal(updated.cwd, "/work/project");
+	assert.equal("sessionFile" in updated, false);
 
 	const running = markScheduledTaskRunning(tasks, "b", NOW);
 	assert.equal(running.status, "running");
@@ -309,6 +321,115 @@ test("failed recurring runs stay scheduled unless maxRuns is reached", () => {
 	assert.equal(failed.lastStatus, "error");
 	assert.equal(failed.lastError, "boom");
 	assert.equal(failed.runCount, 1);
+});
+
+test("catch-up options validate environment overrides", () => {
+	assert.deepEqual(parseCatchUpOptions({}), { windowHours: 24, maxFire: 5 });
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "6", PI_SCHEDULER_CATCHUP_MAX: "12" }),
+		{ windowHours: 6, maxFire: 12 },
+	);
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "-1", PI_SCHEDULER_CATCHUP_MAX: "-1" }),
+		{ windowHours: 24, maxFire: 5 },
+	);
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "Infinity", PI_SCHEDULER_CATCHUP_MAX: "2.5" }),
+		{ windowHours: 24, maxFire: 5 },
+	);
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "invalid", PI_SCHEDULER_CATCHUP_MAX: "invalid" }),
+		{ windowHours: 24, maxFire: 5 },
+	);
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "0", PI_SCHEDULER_CATCHUP_MAX: "0" }),
+		{ windowHours: 0, maxFire: 0 },
+	);
+	assert.deepEqual(
+		parseCatchUpOptions({ PI_SCHEDULER_CATCHUP_WINDOW_H: "  ", PI_SCHEDULER_CATCHUP_MAX: "  " }),
+		{ windowHours: 24, maxFire: 5 },
+	);
+});
+
+test("catch-up selects only due pending cron tasks and uses the latest missed occurrence", () => {
+	const now = new Date("2026-07-05T12:00:30.000Z");
+	const task = (id, schedule, nextRun, overrides = {}) => ({
+		id,
+		action: "notify",
+		type: "cron",
+		schedule,
+		status: "pending",
+		enabled: true,
+		nextRun,
+		dueAt: nextRun,
+		message: id,
+		...overrides,
+	});
+	const tasks = [
+		task("latest", "0 * * * * *", "2026-07-05T11:40:00.000Z"),
+		task("previous-minute", "0 59 * * * *", "2026-07-05T10:59:00.000Z"),
+		task("future", "0 * * * * *", "2026-07-05T12:01:00.000Z"),
+		task("running", "0 * * * * *", "2026-07-05T11:59:00.000Z", { status: "running" }),
+		task("disabled", "0 * * * * *", "2026-07-05T11:59:00.000Z", { enabled: false }),
+		task("once", "5m", "2026-07-05T11:59:00.000Z", { type: "once" }),
+		task("invalid", "not cron", "2026-07-05T11:59:00.000Z"),
+	];
+
+	const selected = selectCatchUpCronTasks(tasks, now, { windowHours: 5 / 60, maxFire: 10 });
+	assert.deepEqual(selected.map(({ task: selectedTask }) => selectedTask.id), ["latest", "previous-minute"]);
+	assert.equal(selected[0].missedAt.toISOString(), "2026-07-05T12:00:00.000Z");
+	assert.equal(selected[1].missedAt.toISOString(), "2026-07-05T11:59:00.000Z");
+	assert.deepEqual(
+		selectCatchUpCronTasks(tasks, now, { windowHours: 24, maxFire: 1 }).map(({ task: selectedTask }) => selectedTask.id),
+		["latest"],
+	);
+	assert.deepEqual(selectCatchUpCronTasks(tasks, now, { windowHours: 24, maxFire: 0 }), []);
+});
+
+test("task scope matching fails closed for missing session and cwd identity", () => {
+	const context = { cwd: "/work/project", sessionFile: "/sessions/current.jsonl" };
+	assert.equal(taskMatchesScope({ scope: "global" }, context), true);
+	assert.equal(taskMatchesScope({ scope: "cwd", cwd: "/work/project" }, context), true);
+	assert.equal(taskMatchesScope({ scope: "cwd", cwd: "/work/other" }, context), false);
+	assert.equal(taskMatchesScope({ scope: "cwd" }, context), false);
+	assert.equal(taskMatchesScope({ scope: "session", sessionFile: "/sessions/current.jsonl" }, context), true);
+	assert.equal(taskMatchesScope({ scope: "session", sessionFile: "/sessions/other.jsonl" }, context), false);
+	assert.equal(taskMatchesScope({ scope: "session" }, context), false);
+	assert.equal(taskMatchesScope({ scope: "session", sessionFile: "/sessions/current.jsonl" }, { cwd: "/work/project" }), false);
+});
+
+test("recoverInterruptedTasks fails one-shot attempts and reschedules recurring attempts", () => {
+	const tasks = [
+		createScheduledTask({ action: "shell", type: "once", schedule: "5m", command: "echo once" }, NOW, () => "once"),
+		createScheduledTask({ action: "shell", type: "interval", schedule: "10m", command: "echo recurring" }, NOW, () => "interval"),
+		createScheduledTask({ action: "notify", type: "once", schedule: "5m", message: "pending" }, NOW, () => "pending"),
+		createScheduledTask({ action: "shell", type: "interval", schedule: "10m", command: "echo active" }, NOW, () => "active"),
+	];
+	markScheduledTaskRunning(tasks, "once", NOW);
+	markScheduledTaskRunning(tasks, "interval", NOW, { runOwner: { pid: 101, attemptId: "dead-attempt" } });
+	markScheduledTaskRunning(tasks, "active", NOW, { runOwner: { pid: 202, attemptId: "live-attempt" } });
+
+	const recovered = recoverInterruptedTasks(tasks, new Date(NOW.getTime() + minutes(2)), {
+		isOwnerActive: (owner) => owner?.pid === 202,
+	});
+	assert.deepEqual(recovered.map((task) => task.id), ["once", "interval"]);
+	assert.equal(tasks[0].status, "failed");
+	assert.equal(tasks[0].enabled, false);
+	assert.equal(tasks[0].lastStatus, "error");
+	assert.match(tasks[0].lastError, /interrupted/i);
+	assert.equal(tasks[0].runCount, 1);
+	assert.equal(tasks[1].status, "pending");
+	assert.equal(tasks[1].enabled, true);
+	assert.equal(tasks[1].lastStatus, "error");
+	assert.match(tasks[1].lastError, /interrupted/i);
+	assert.equal(tasks[1].runCount, 1);
+	assert.ok(Date.parse(tasks[1].nextRun) > NOW.getTime() + minutes(2));
+	assert.equal("runOwner" in tasks[1], false);
+	assert.equal(tasks[2].status, "pending");
+	assert.equal(tasks[2].runCount, 0);
+	assert.equal(tasks[3].status, "running");
+	assert.equal(tasks[3].runCount, 0);
+	assert.equal(tasks[3].runOwner.attemptId, "live-attempt");
 });
 
 test("shell wakeOn helper matches success and failure conditions", () => {

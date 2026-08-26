@@ -29,6 +29,8 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 const WEEK = 7 * DAY;
+const DEFAULT_CATCHUP_WINDOW_HOURS = 24;
+const DEFAULT_CATCHUP_MAX_FIRE = 5;
 
 function asDate(value) {
 	const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
@@ -397,7 +399,7 @@ function normalizeTask(task, nowValue = new Date()) {
 	const migrated = { ...task, action, type, schedule, status };
 	migrated.enabled = task.enabled === undefined ? !isTerminal(migrated) : Boolean(task.enabled);
 	migrated.runCount = Number.isInteger(task.runCount) && task.runCount >= 0 ? task.runCount : 0;
-	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : "session";
+	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : task.sessionFile ? "session" : task.cwd ? "cwd" : "global";
 	migrated.whenText = compactSpaces(task.whenText ?? task.when ?? schedule);
 	migrated.createdAt = Number.isNaN(Date.parse(task.createdAt)) ? asDate(nowValue).toISOString() : task.createdAt;
 	if (task.maxRuns !== undefined) migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
@@ -449,6 +451,13 @@ function sortByNextRun(a, b) {
 	return (Number.isFinite(aTime) ? aTime : Number.POSITIVE_INFINITY) - (Number.isFinite(bTime) ? bTime : Number.POSITIVE_INFINITY);
 }
 
+function taskMatchesScope(task, context = {}) {
+	const scope = task.scope ?? "session";
+	if (scope === "global") return true;
+	if (scope === "cwd") return Boolean(task.cwd && context.cwd && task.cwd === context.cwd);
+	return Boolean(task.sessionFile && context.sessionFile && task.sessionFile === context.sessionFile);
+}
+
 function pendingTasks(tasks) {
 	return tasks
 		.filter((task) => task.enabled !== false && !isTerminal(task))
@@ -459,6 +468,56 @@ function pendingTasks(tasks) {
 function dueTasks(tasks, nowValue = new Date()) {
 	const now = asDate(nowValue).getTime();
 	return pendingTasks(tasks).filter((task) => task.status === "pending" && Date.parse(task.nextRun ?? task.dueAt) <= now);
+}
+
+function parseCatchUpOptions(env = {}) {
+	const rawWindow = typeof env.PI_SCHEDULER_CATCHUP_WINDOW_H === "string"
+		? env.PI_SCHEDULER_CATCHUP_WINDOW_H.trim()
+		: env.PI_SCHEDULER_CATCHUP_WINDOW_H;
+	const parsedWindow = rawWindow === undefined || rawWindow === "" ? Number.NaN : Number(rawWindow);
+	const windowHours = Number.isFinite(parsedWindow) && parsedWindow >= 0 && Number.isFinite(parsedWindow * HOUR)
+		? parsedWindow
+		: DEFAULT_CATCHUP_WINDOW_HOURS;
+
+	const rawMax = typeof env.PI_SCHEDULER_CATCHUP_MAX === "string"
+		? env.PI_SCHEDULER_CATCHUP_MAX.trim()
+		: env.PI_SCHEDULER_CATCHUP_MAX;
+	const parsedMax = rawMax === undefined || rawMax === "" ? Number.NaN : Number(rawMax);
+	const maxFire = Number.isSafeInteger(parsedMax) && parsedMax >= 0 ? parsedMax : DEFAULT_CATCHUP_MAX_FIRE;
+	return { windowHours, maxFire };
+}
+
+function latestMissedCronRun(task, now) {
+	const persistedNext = Date.parse(task.nextRun ?? task.dueAt ?? "");
+	if (!Number.isFinite(persistedNext) || persistedNext > now.getTime()) return undefined;
+
+	let cron;
+	try {
+		cron = new Cron(task.schedule, { paused: true }, () => {});
+		const [latest] = cron.previousRuns(1, now);
+		if (latest && latest.getTime() >= persistedNext && latest.getTime() <= now.getTime()) return latest;
+	} catch {
+		return undefined;
+	} finally {
+		cron?.stop();
+	}
+	return new Date(persistedNext);
+}
+
+function selectCatchUpCronTasks(tasks, nowValue = new Date(), options = {}) {
+	const now = asDate(nowValue);
+	const windowHours = Number(options.windowHours);
+	const maxFire = Number(options.maxFire);
+	if (!Number.isFinite(windowHours) || windowHours < 0 || !Number.isSafeInteger(maxFire) || maxFire <= 0) return [];
+	const windowMs = windowHours * HOUR;
+	if (!Number.isFinite(windowMs)) return [];
+
+	return tasks
+		.filter((task) => task.type === "cron" && task.enabled !== false && task.status === "pending")
+		.map((task) => ({ task, missedAt: latestMissedCronRun(task, now) }))
+		.filter((entry) => entry.missedAt && now.getTime() - entry.missedAt.getTime() <= windowMs)
+		.sort((a, b) => b.missedAt.getTime() - a.missedAt.getTime())
+		.slice(0, maxFire);
 }
 
 function findTask(tasks, idOrPrefix) {
@@ -524,7 +583,8 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.description !== undefined) task.description = compactSpaces(updates.description);
 	if (updates.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(updates.maxRuns);
 	if (updates.cwd !== undefined) task.cwd = String(updates.cwd);
-	if (updates.sessionFile !== undefined) task.sessionFile = String(updates.sessionFile);
+	if (updates.sessionFile === null) delete task.sessionFile;
+	else if (updates.sessionFile !== undefined) task.sessionFile = String(updates.sessionFile);
 	if (updates.timeoutMs !== undefined) task.timeoutMs = validateTimeoutMs(updates.timeoutMs);
 	if (updates.followUpPrompt !== undefined) task.followUpPrompt = compactSpaces(updates.followUpPrompt) || undefined;
 	if (updates.successPrompt !== undefined) task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
@@ -555,7 +615,7 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	return task;
 }
 
-function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date()) {
+function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date(), options = {}) {
 	const now = asDate(nowValue);
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
@@ -563,10 +623,12 @@ function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date()) {
 	task.status = "running";
 	task.lastStatus = "running";
 	task.startedAt = now.toISOString();
+	if (options.runOwner) task.runOwner = { ...options.runOwner, startedAt: now.toISOString() };
 	return task;
 }
 
 function finishTaskAfterRun(task, now, ok, result) {
+	delete task.runOwner;
 	task.runCount = (Number.isInteger(task.runCount) ? task.runCount : 0) + 1;
 	task.lastRun = now.toISOString();
 	task.lastStatus = ok ? "success" : "error";
@@ -615,6 +677,17 @@ function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	task.lastError = error instanceof Error ? error.message : String(error);
 	return finishTaskAfterRun(task, asDate(nowValue), false, undefined);
+}
+
+function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
+	const now = asDate(nowValue);
+	const interrupted = tasks.filter(
+		(task) => task.enabled !== false && task.status === "running" && !options.isOwnerActive?.(task.runOwner),
+	);
+	for (const task of interrupted) {
+		markScheduledTaskFailed(tasks, task.id, now, new Error("Scheduled task was interrupted before completion"));
+	}
+	return interrupted;
 }
 
 function shellResultOk(result) {
@@ -731,8 +804,12 @@ module.exports = {
 	createScheduledTask,
 	normalizeTask,
 	sanitizeTasks,
+	taskMatchesScope,
 	pendingTasks,
 	dueTasks,
+	parseCatchUpOptions,
+	selectCatchUpCronTasks,
+	recoverInterruptedTasks,
 	cancelScheduledTask,
 	disableScheduledTask,
 	enableScheduledTask,

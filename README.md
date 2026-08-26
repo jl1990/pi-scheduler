@@ -223,7 +223,19 @@ Pi Scheduler currently uses **in-process timers**:
 
 - If Pi is running, tasks fire at the scheduled time.
 - If Pi is closed, tasks do not fire while Pi is closed.
-- Pending/missed tasks are loaded again when the relevant Pi session starts, and due tasks fire then.
+- Overdue one-shot and interval tasks fire when the relevant Pi session starts again.
+- For each overdue cron task, Pi Scheduler catches up its most recent missed occurrence when that occurrence is inside the configured catch-up window. Catch-up is newest-first and bounded per startup.
+
+Cron catch-up can be configured with environment variables:
+
+| Variable | Default | Description |
+| --- | ---: | --- |
+| `PI_SCHEDULER_CATCHUP_WINDOW_H` | `24` | Maximum age, in hours, of the most recent missed cron occurrence. |
+| `PI_SCHEDULER_CATCHUP_MAX` | `5` | Maximum number of missed cron tasks fired per session start. Set to `0` to disable cron catch-up. |
+
+Invalid, negative, or non-finite values fall back to the defaults; `PI_SCHEDULER_CATCHUP_MAX` must also be a whole number. If Pi stopped while a task was already running, the interrupted attempt is recorded as failed rather than retried blindly: one-shot tasks remain failed, while recurring tasks are rescheduled from startup time.
+
+Task state is shared but not cross-process locked. Running multiple Pi processes against the same `cwd` or `global` tasks can race, so use those scopes from one active Pi process at a time.
 
 This is enough for live agent workflows like CI polling while a Pi session is open. A future version could add OS-level `cron`, `at`, launchd, systemd, or a small daemon for exact wakeups while Pi is not running.
 

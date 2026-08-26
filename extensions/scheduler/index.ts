@@ -2,6 +2,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -40,12 +41,19 @@ function currentSessionFile(ctx: ExtensionContext): string | undefined {
 }
 
 function taskBelongsToSession(task: ScheduledTask, ctx: ExtensionContext): boolean {
-	const scope = task.scope ?? "session";
-	if (scope === "global") return true;
-	if (scope === "cwd") return !task.cwd || task.cwd === ctx.cwd;
+	return core.taskMatchesScope(task, { cwd: ctx.cwd, sessionFile: currentSessionFile(ctx) });
+}
 
-	const sessionFile = currentSessionFile(ctx);
-	return !task.sessionFile || !sessionFile || task.sessionFile === sessionFile;
+function isRunOwnerActive(owner: Record<string, any> | undefined): boolean {
+	const pid = Number(owner?.pid);
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	if (pid === process.pid) return true;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error: any) {
+		return error?.code === "EPERM";
+	}
 }
 
 function sendAgentPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string): void {
@@ -109,9 +117,20 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	let tasks: ScheduledTask[] = [];
 	let handles = new Map<string, TimerHandle>();
 	let activeCtx: ExtensionContext | undefined;
+	let sessionGeneration = 0;
 	let saveQueue: Promise<void> = Promise.resolve();
 	let widgetEnabled = true;
 	const firing = new Set<string>();
+
+	function isSessionActive(ctx: ExtensionContext, generation = sessionGeneration): boolean {
+		if (activeCtx !== ctx || sessionGeneration !== generation) return false;
+		try {
+			ctx.isIdle(); // Pi throws when a captured extension context has become stale.
+			return true;
+		} catch {
+			return false;
+		}
+	}
 
 	async function loadTasks(): Promise<void> {
 		try {
@@ -186,7 +205,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		updateWidget(ctx);
 	}
 
-	function scheduleTaskHandle(task: ScheduledTask, ctx: ExtensionContext): void {
+	function scheduleTaskHandle(task: ScheduledTask, ctx: ExtensionContext, generation = sessionGeneration): void {
+		if (!isSessionActive(ctx, generation)) return;
 		if (task.enabled === false || task.status !== "pending") return;
 		if (!taskBelongsToSession(task, ctx)) return;
 		clearHandle(task.id);
@@ -194,7 +214,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (task.type === "cron") {
 			try {
 				const cron = new Cron(task.schedule, () => {
-					void fireTask(task.id, ctx);
+					void fireTask(task.id, ctx, generation);
 				});
 				handles.set(task.id, { kind: "cron", handle: cron });
 			} catch (error: any) {
@@ -214,20 +234,46 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 		const timer = setTimeout(() => {
 			handles.delete(task.id);
+			if (!isSessionActive(ctx, generation)) return;
 			if (Date.now() < dueAt) {
-				scheduleTaskHandle(task, ctx);
+				scheduleTaskHandle(task, ctx, generation);
 				return;
 			}
-			void fireTask(task.id, ctx);
+			void fireTask(task.id, ctx, generation);
 		}, timerDelay);
 		handles.set(task.id, { kind: "timeout", handle: timer });
 	}
 
-	function rescheduleAll(ctx = activeCtx): void {
-		if (!ctx) return;
+	function rescheduleAll(ctx = activeCtx, generation = sessionGeneration): void {
+		if (!ctx || !isSessionActive(ctx, generation)) return;
 		clearTimers();
-		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx);
+		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx, generation);
 		updateStatus(ctx);
+	}
+
+	async function catchUpOverdueCronTasks(
+		ctx: ExtensionContext,
+		generation: number,
+		options: { windowHours: number; maxFire: number },
+	): Promise<void> {
+		const overdue = core.selectCatchUpCronTasks(visibleTasks(ctx), new Date(), options);
+		if (overdue.length === 0 || !isSessionActive(ctx, generation)) return;
+
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`Catching up ${overdue.length} missed cron task(s) (window ${options.windowHours}h, limit ${options.maxFire})`,
+				"info",
+			);
+		}
+
+		for (const { task, missedAt } of overdue) {
+			if (!isSessionActive(ctx, generation)) return;
+			// Record the most recent missed occurrence so prompts and persisted state
+			// describe the run being caught up, not the first occurrence missed.
+			task.nextRun = missedAt.toISOString();
+			task.dueAt = task.nextRun;
+			await fireTask(task.id, ctx, generation);
+		}
 	}
 
 	function recordMessage(content: string, details?: Record<string, any>, triggerTurn = false): void {
@@ -242,7 +288,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	async function executeTask(task: ScheduledTask, ctx: ExtensionContext): Promise<Record<string, any>> {
+	async function executeTask(
+		task: ScheduledTask,
+		ctx: ExtensionContext,
+		isActive: () => boolean,
+	): Promise<Record<string, any>> {
 		if (task.action === "notify") {
 			const message = task.message ?? "Scheduled reminder";
 			if (ctx.hasUI) ctx.ui.notify(message, "info");
@@ -279,6 +329,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				stderr: truncateMiddle(result.stderr ?? "", MAX_STORED_OUTPUT_CHARS),
 			};
 
+			if (!isActive()) return { ...shellResult, outputSuppressed: true };
+
 			recordMessage(
 				`🖥️ Scheduled command ${task.id} finished with exit code ${result.code}: ${task.command}`,
 				{ task, result: shellResult },
@@ -296,40 +348,67 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		throw new Error(`Unsupported scheduled action: ${task.action}`);
 	}
 
-	async function fireTask(taskId: string, ctx: ExtensionContext): Promise<void> {
+	async function fireTask(taskId: string, ctx: ExtensionContext, generation = sessionGeneration): Promise<void> {
+		if (!isSessionActive(ctx, generation)) return;
 		const task = tasks.find((candidate) => candidate.id === taskId);
 		if (!task || task.enabled === false || task.status !== "pending" || firing.has(task.id)) return;
 		if (!taskBelongsToSession(task, ctx)) return;
 
 		firing.add(task.id);
+		const attemptId = randomUUID();
 		try {
-			core.markScheduledTaskRunning(tasks, task.id, new Date());
+			core.markScheduledTaskRunning(tasks, task.id, new Date(), {
+				runOwner: { pid: process.pid, attemptId, sessionFile: currentSessionFile(ctx) },
+			});
 			await saveTasks();
+			if (!isSessionActive(ctx, generation)) {
+				const currentTask = tasks.find((candidate) => candidate.id === task.id);
+				if (currentTask?.runOwner?.attemptId === attemptId) {
+					currentTask.status = "pending";
+					currentTask.lastStatus = "error";
+					currentTask.lastError = "Scheduled task start was cancelled because the Pi session changed";
+					delete currentTask.runOwner;
+					delete currentTask.startedAt;
+					await saveTasks();
+				}
+				return;
+			}
 			updateStatus(ctx);
-			const result = await executeTask(task, ctx);
-			core.markScheduledTaskCompleted(tasks, task.id, new Date(), result, { ok: result.ok !== false });
+			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
+			const currentTask = tasks.find((candidate) => candidate.id === task.id);
+			if (currentTask?.runOwner?.attemptId !== attemptId) return;
+			core.markScheduledTaskCompleted(tasks, currentTask.id, new Date(), result, { ok: result.ok !== false });
 			await saveTasks();
 		} catch (error: any) {
-			core.markScheduledTaskFailed(tasks, task.id, new Date(), error);
+			const currentTask = tasks.find((candidate) => candidate.id === task.id);
+			if (currentTask?.runOwner?.attemptId !== attemptId) return;
+			core.markScheduledTaskFailed(tasks, currentTask.id, new Date(), error);
 			await saveTasks();
-			const message = `Scheduled task ${task.id} failed: ${error?.message ?? String(error)}`;
-			if (ctx.hasUI) ctx.ui.notify(message, "error");
-			recordMessage(`⚠️ ${message}`, { task, error: error?.message ?? String(error) }, false);
+			if (isSessionActive(ctx, generation)) {
+				const message = `Scheduled task ${currentTask.id} failed: ${error?.message ?? String(error)}`;
+				if (ctx.hasUI) ctx.ui.notify(message, "error");
+				recordMessage(`⚠️ ${message}`, { task: currentTask, error: error?.message ?? String(error) }, false);
+			}
 		} finally {
 			firing.delete(task.id);
-			rescheduleAll(ctx);
+			if (isSessionActive(ctx, generation)) rescheduleAll(ctx, generation);
+			else if (activeCtx) rescheduleAll(activeCtx, sessionGeneration);
 		}
 	}
 
 	async function createAndSchedule(input: Record<string, any>, ctx: ExtensionContext): Promise<ScheduledTask> {
 		const scope = input.scope ?? "session";
+		const sessionFile = scope === "session" ? currentSessionFile(ctx) : undefined;
+		if (scope === "session" && !sessionFile) {
+			throw new Error("Session-scoped tasks require a persisted Pi session; use scope 'cwd' or 'global' instead");
+		}
 		const task = core.createScheduledTask(
 			{
 				...input,
 				schedule: input.schedule ?? input.when ?? input.whenText,
 				cwd: input.cwd ?? ctx.cwd,
 				scope,
-				sessionFile: scope === "session" ? currentSessionFile(ctx) : undefined,
+				sessionFile,
 			},
 			new Date(),
 		);
@@ -385,11 +464,34 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		activeCtx = ctx;
+		const generation = ++sessionGeneration;
 		await loadTasks();
-		rescheduleAll(ctx);
+		if (!isSessionActive(ctx, generation)) return;
+
+		const interrupted = core.recoverInterruptedTasks(tasks, new Date(), { isOwnerActive: isRunOwnerActive });
+		if (interrupted.length > 0) {
+			await saveTasks();
+			if (!isSessionActive(ctx, generation)) return;
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Recovered ${interrupted.length} task(s) interrupted before completion; recurring tasks were rescheduled`,
+					"warning",
+				);
+			}
+		}
+
+		rescheduleAll(ctx, generation);
+		const catchUpOptions = core.parseCatchUpOptions(process.env);
+		void catchUpOverdueCronTasks(ctx, generation, catchUpOptions).catch((error: any) => {
+			if (isSessionActive(ctx, generation) && ctx.hasUI) {
+				ctx.ui.notify(`Failed to catch up missed cron tasks: ${error?.message ?? String(error)}`, "error");
+			}
+		});
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		if (activeCtx !== ctx) return;
+		++sessionGeneration;
 		clearTimers();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("scheduler", undefined);
@@ -689,9 +791,17 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				task = core.removeScheduledTask(tasks, visibleRemoved.id);
 				clearHandle(task.id);
 			} else {
-				const updates = { ...params };
+				const updates: Record<string, any> = { ...params };
 				delete updates.action;
 				delete updates.id;
+				if (updates.scope === "session") {
+					updates.sessionFile = currentSessionFile(ctx);
+					if (!updates.sessionFile) {
+						throw new Error("Session-scoped tasks require a persisted Pi session");
+					}
+				} else if (updates.scope !== undefined) {
+					updates.sessionFile = null;
+				}
 				task = core.updateScheduledTask(visibleTasks(ctx), params.id, updates, new Date());
 			}
 
