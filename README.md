@@ -54,7 +54,9 @@ Use a test command that finishes rather than entering watch mode. Every five min
 - **Non-zero exit or timeout:** wake the agent with stdout/stderr to investigate.
 - **Ten executions:** disable the task automatically.
 
-Recurring tasks do not stop when an external goal completes. Cancel them when finished, or bound them with `maxRuns`.
+For recurring shell tasks, `stopOn` may be `success`, `failure`, or `never` (the default). It disables recurrence after the matching result; non-zero exits, timeouts, and killed commands count as failures. `stopOn` is independent of `wakeOn`.
+
+Recurring tasks do not stop when an external goal completes unless configured with `stopOn`. Cancel them when finished, or bound them with `maxRuns`.
 
 ## Scheduling options
 
@@ -64,6 +66,7 @@ Recurring tasks do not stop when an external goal completes. Cancel them when fi
 | Schedule | `once`: `5m`, `tomorrow at 9am`, ISO datetime; `interval`: `30s`, `5m`, `1h`; `cron`: `0 0 9 * * 1-5` (weekdays at 9am) |
 | Scope | `session` (default): creating session; `cwd`: sessions in the same project directory; `global`: any session |
 | Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command |
+| `stopOn` | For shell actions, stop recurrence after `success`, `failure`, or `never` (default) |
 
 Cron uses `croner`; six-field expressions with seconds are recommended. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
 
