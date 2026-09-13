@@ -28,6 +28,7 @@ Without scheduling, the agent has to stop and hope you come back. With Pi Schedu
 - **Scopes** — bind tasks to a session, cwd/project, or all sessions.
 - **Compact widget** — shows the next few scheduled actions below the editor.
 - **Persistent state** — scheduled tasks are stored in `~/.pi/agent/state/scheduler/tasks.json`.
+- **Multi-process coordination** — atomic state transactions and task claims allow multiple Pi agents to share a cwd safely.
 
 ## Install
 
@@ -235,7 +236,9 @@ Cron catch-up can be configured with environment variables:
 
 Invalid, negative, or non-finite values fall back to the defaults; `PI_SCHEDULER_CATCHUP_MAX` must also be a whole number. If Pi stopped while a task was already running, the interrupted attempt is recorded as failed rather than retried blindly: one-shot tasks remain failed, while recurring tasks are rescheduled from startup time.
 
-Task state is shared but not cross-process locked. Running multiple Pi processes against the same `cwd` or `global` tasks can race, so use those scopes from one active Pi process at a time.
+Task state is coordinated across Pi processes with an atomic filesystem lock. Multiple agents may share the same cwd: all relevant processes can observe `cwd` tasks, while an atomic claim ensures only one process executes each due occurrence. The process that wins the claim receives prompt/message follow-ups. Use `session` scope when a follow-up must return to one specific Pi session.
+
+Running processes refresh shared scheduler state every five seconds so they can discover tasks created by another agent. `global` tasks use the same single-claim behavior across all running Pi processes.
 
 This is enough for live agent workflows like CI polling while a Pi session is open. A future version could add OS-level `cron`, `at`, launchd, systemd, or a small daemon for exact wakeups while Pi is not running.
 

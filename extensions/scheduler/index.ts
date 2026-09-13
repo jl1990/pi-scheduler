@@ -3,14 +3,15 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { Type } from "typebox";
 
 // Keep the scheduler logic testable from plain node --test.
 const core = require("./scheduler-core.cjs");
 const lifecycle = require("./scheduler-lifecycle.cjs");
+const coordination = require("./scheduler-coordination.cjs");
+const { createTaskStore } = require("./task-store.cjs");
 
 const ACTIONS = ["notify", "prompt", "shell", "message"] as const;
 const TYPES = ["once", "interval", "cron"] as const;
@@ -18,8 +19,9 @@ const SCOPES = ["session", "cwd", "global"] as const;
 const WAKE_ON = ["always", "failure", "success", "never"] as const;
 const MANAGE_ACTIONS = ["enable", "disable", "remove", "update", "cleanup"] as const;
 
-const STATE_FILE = join(homedir(), ".pi", "agent", "state", "scheduler", "tasks.json");
+const STATE_FILE = process.env.PI_SCHEDULER_STATE_FILE || join(homedir(), ".pi", "agent", "state", "scheduler", "tasks.json");
 const MAX_TIMER_DELAY_MS = 2_147_483_647; // setTimeout's practical max (~24.8 days)
+const STATE_REFRESH_INTERVAL_MS = 5_000;
 const DEFAULT_SHELL_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_STORED_OUTPUT_CHARS = 12_000;
 const MAX_PROMPT_OUTPUT_CHARS = 18_000;
@@ -119,37 +121,35 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	let handles = new Map<string, TimerHandle>();
 	let activeCtx: ExtensionContext | undefined;
 	let sessionGeneration = 0;
-	let saveQueue: Promise<void> = Promise.resolve();
+	let stateRevision = -1;
 	let widgetEnabled = true;
 	const firing = new Set<string>();
+	const store = createTaskStore({ stateFile: STATE_FILE, sanitize: core.sanitizeTasks });
 
 	function isSessionActive(ctx: ExtensionContext, generation = sessionGeneration): boolean {
 		return lifecycle.isSessionContextActive(activeCtx, ctx, sessionGeneration, generation);
 	}
 
-	async function loadTasks(): Promise<void> {
-		try {
-			const raw = await readFile(STATE_FILE, "utf8");
-			const parsed = JSON.parse(raw);
-			tasks = core.sanitizeTasks(parsed.tasks ?? parsed);
-		} catch (error: any) {
-			if (error?.code === "ENOENT") {
-				tasks = [];
-				return;
-			}
-			throw error;
-		}
+	async function loadTasks(): Promise<boolean> {
+		const snapshot = await store.read();
+		return coordination.reconcileSnapshot(
+			snapshot,
+			stateRevision,
+			(nextTasks: ScheduledTask[], revision: number) => {
+				tasks = nextTasks;
+				stateRevision = revision;
+			},
+			() => rescheduleAll(),
+		);
 	}
 
-	async function saveTasks(): Promise<void> {
-		const payload = JSON.stringify({ version: 2, updatedAt: new Date().toISOString(), tasks }, null, 2) + "\n";
-		saveQueue = saveQueue.then(async () => {
-			await mkdir(dirname(STATE_FILE), { recursive: true });
-			const tmp = `${STATE_FILE}.${process.pid}.tmp`;
-			await writeFile(tmp, payload, "utf8");
-			await rename(tmp, STATE_FILE);
-		});
-		return saveQueue;
+	async function transactTasks<T>(mutator: (current: ScheduledTask[]) => T | Promise<T>): Promise<T> {
+		const transaction = await store.transact(mutator);
+		if (transaction.revision >= stateRevision) {
+			tasks = transaction.tasks;
+			stateRevision = transaction.revision;
+		}
+		return transaction.result;
 	}
 
 	function clearHandle(id: string): void {
@@ -213,11 +213,15 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				});
 				handles.set(task.id, { kind: "cron", handle: cron });
 			} catch (error: any) {
-				task.enabled = false;
-				task.status = "failed";
-				task.lastStatus = "error";
-				task.lastError = error?.message ?? String(error);
-				void saveTasks();
+				const message = error?.message ?? String(error);
+				void transactTasks((current) => {
+					const persisted = current.find((candidate) => candidate.id === task.id);
+					if (!persisted) return;
+					persisted.enabled = false;
+					persisted.status = "failed";
+					persisted.lastStatus = "error";
+					persisted.lastError = message;
+				});
 			}
 			return;
 		}
@@ -239,11 +243,43 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		handles.set(task.id, { kind: "timeout", handle: timer });
 	}
 
-	function rescheduleAll(ctx = activeCtx, generation = sessionGeneration): void {
+	function rescheduleAll(generation = sessionGeneration): void {
+		const ctx = activeCtx;
 		if (!ctx || !isSessionActive(ctx, generation)) return;
 		clearTimers();
 		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx, generation);
 		updateStatus(ctx);
+	}
+
+	async function refreshFromStore(generation = sessionGeneration): Promise<void> {
+		const ctx = activeCtx;
+		if (!ctx || !isSessionActive(ctx, generation)) return;
+		await coordination.refreshSchedulerState({
+			store,
+			currentRevision: () => stateRevision,
+			isOwnerActive: isRunOwnerActive,
+			recoverInterrupted: core.recoverInterruptedTasks,
+			now: () => new Date(),
+			install: (nextTasks: ScheduledTask[], revision: number) => {
+				tasks = nextTasks;
+				stateRevision = revision;
+			},
+			reconcile: () => rescheduleAll(generation),
+		});
+	}
+
+	const refreshLoop = coordination.createRefreshLoop({
+		intervalMs: STATE_REFRESH_INTERVAL_MS,
+		run: refreshFromStore,
+		onError: (error: any) => {
+			if (activeCtx?.hasUI) activeCtx.ui.notify(`Scheduler state refresh failed: ${error?.message ?? String(error)}`, "error");
+		},
+		setInterval,
+		clearInterval,
+	});
+
+	function startStateRefresh(generation: number): void {
+		refreshLoop.start(generation);
 	}
 
 	async function catchUpOverdueCronTasks(
@@ -263,11 +299,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 		for (const { task, missedAt } of overdue) {
 			if (!isSessionActive(ctx, generation)) return;
-			// Record the most recent missed occurrence so prompts and persisted state
-			// describe the run being caught up, not the first occurrence missed.
-			task.nextRun = missedAt.toISOString();
-			task.dueAt = task.nextRun;
-			await fireTask(task.id, ctx, generation);
+			await fireTask(task.id, ctx, generation, {
+				expectedNextRun: task.nextRun ?? task.dueAt,
+				occurrence: missedAt.toISOString(),
+			});
 		}
 	}
 
@@ -343,51 +378,75 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		throw new Error(`Unsupported scheduled action: ${task.action}`);
 	}
 
-	async function fireTask(taskId: string, ctx: ExtensionContext, generation = sessionGeneration): Promise<void> {
-		if (!isSessionActive(ctx, generation)) return;
-		const task = tasks.find((candidate) => candidate.id === taskId);
-		if (!task || task.enabled === false || task.status !== "pending" || firing.has(task.id)) return;
-		if (!taskBelongsToSession(task, ctx)) return;
+	async function fireTask(
+		taskId: string,
+		ctx: ExtensionContext,
+		generation = sessionGeneration,
+		claimOptions?: { expectedNextRun?: string; occurrence?: string },
+	): Promise<void> {
+		if (!isSessionActive(ctx, generation) || firing.has(taskId)) return;
 
-		firing.add(task.id);
+		firing.add(taskId);
 		const attemptId = randomUUID();
+		let task: ScheduledTask | undefined;
 		try {
-			core.markScheduledTaskRunning(tasks, task.id, new Date(), {
-				runOwner: { pid: process.pid, attemptId, sessionFile: currentSessionFile(ctx) },
-			});
-			await saveTasks();
-			if (!isSessionActive(ctx, generation)) {
-				const currentTask = tasks.find((candidate) => candidate.id === task.id);
-				if (currentTask?.runOwner?.attemptId === attemptId) {
-					currentTask.status = "pending";
-					currentTask.lastStatus = "error";
-					currentTask.lastError = "Scheduled task start was cancelled because the Pi session changed";
-					delete currentTask.runOwner;
-					delete currentTask.startedAt;
-					await saveTasks();
+			// Claim under the shared state lock. Other Pi processes may have armed the
+			// same cwd/global task, but only one can transition it to running.
+			task = await transactTasks((current) => {
+				const candidate = current.find((item) => item.id === taskId);
+				if (!candidate || candidate.enabled === false || candidate.status !== "pending") return undefined;
+				if (!taskBelongsToSession(candidate, ctx)) return undefined;
+				const persistedNextRun = candidate.nextRun ?? candidate.dueAt;
+				if (claimOptions?.expectedNextRun && persistedNextRun !== claimOptions.expectedNextRun) return undefined;
+				const dueAt = Date.parse(claimOptions?.occurrence ?? persistedNextRun ?? "");
+				if (!Number.isFinite(dueAt) || dueAt > Date.now()) return undefined;
+				if (claimOptions?.occurrence) {
+					candidate.nextRun = claimOptions.occurrence;
+					candidate.dueAt = claimOptions.occurrence;
 				}
+				core.markScheduledTaskRunning(current, candidate.id, new Date(), {
+					runOwner: { pid: process.pid, attemptId, sessionFile: currentSessionFile(ctx) },
+				});
+				return { ...candidate, runOwner: { ...candidate.runOwner } };
+			});
+			if (!task) return;
+
+			if (!isSessionActive(ctx, generation)) {
+				await transactTasks((current) => {
+					const persisted = current.find((candidate) => candidate.id === taskId);
+					if (persisted?.runOwner?.attemptId !== attemptId) return;
+					persisted.status = "pending";
+					persisted.lastStatus = "error";
+					persisted.lastError = "Scheduled task start was cancelled because the Pi session changed";
+					delete persisted.runOwner;
+					delete persisted.startedAt;
+				});
 				return;
 			}
+
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
-			const currentTask = tasks.find((candidate) => candidate.id === task.id);
-			if (currentTask?.runOwner?.attemptId !== attemptId) return;
-			core.markScheduledTaskCompleted(tasks, currentTask.id, new Date(), result, { ok: result.ok !== false });
-			await saveTasks();
+			await transactTasks((current) => {
+				const persisted = current.find((candidate) => candidate.id === taskId);
+				if (persisted?.runOwner?.attemptId !== attemptId) return;
+				core.markScheduledTaskCompleted(current, persisted.id, new Date(), result, { ok: result.ok !== false });
+			});
 		} catch (error: any) {
-			const currentTask = tasks.find((candidate) => candidate.id === task.id);
-			if (currentTask?.runOwner?.attemptId !== attemptId) return;
-			core.markScheduledTaskFailed(tasks, currentTask.id, new Date(), error);
-			await saveTasks();
-			if (isSessionActive(ctx, generation)) {
-				const message = `Scheduled task ${currentTask.id} failed: ${error?.message ?? String(error)}`;
+			let failedTask: ScheduledTask | undefined;
+			await transactTasks((current) => {
+				const persisted = current.find((candidate) => candidate.id === taskId);
+				if (persisted?.runOwner?.attemptId !== attemptId) return;
+				core.markScheduledTaskFailed(current, persisted.id, new Date(), error);
+				failedTask = { ...persisted };
+			});
+			if (failedTask && isSessionActive(ctx, generation)) {
+				const message = `Scheduled task ${taskId} failed: ${error?.message ?? String(error)}`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
-				recordMessage(`⚠️ ${message}`, { task: currentTask, error: error?.message ?? String(error) }, false);
+				recordMessage(`⚠️ ${message}`, { task: failedTask, error: error?.message ?? String(error) }, false);
 			}
 		} finally {
-			firing.delete(task.id);
-			if (isSessionActive(ctx, generation)) rescheduleAll(ctx, generation);
-			else if (activeCtx) rescheduleAll(activeCtx, sessionGeneration);
+			firing.delete(taskId);
+			if (activeCtx) rescheduleAll(sessionGeneration);
 		}
 	}
 
@@ -397,19 +456,21 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (scope === "session" && !sessionFile) {
 			throw new Error("Session-scoped tasks require a persisted Pi session; use scope 'cwd' or 'global' instead");
 		}
-		const task = core.createScheduledTask(
-			{
-				...input,
-				schedule: input.schedule ?? input.when ?? input.whenText,
-				cwd: input.cwd ?? ctx.cwd,
-				scope,
-				sessionFile,
-			},
-			new Date(),
-		);
-		tasks.push(task);
-		await saveTasks();
-		rescheduleAll(ctx);
+		const task = await transactTasks((current) => {
+			const created = core.createScheduledTask(
+				{
+					...input,
+					schedule: input.schedule ?? input.when ?? input.whenText,
+					cwd: input.cwd ?? ctx.cwd,
+					scope,
+					sessionFile,
+				},
+				new Date(),
+			);
+			current.push(created);
+			return created;
+		});
+		rescheduleAll();
 		return task;
 	}
 
@@ -426,12 +487,12 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return { ...base, message: parsed.payload };
 	}
 
-	function cleanupVisibleTasks(ctx: ExtensionContext): ScheduledTask[] {
-		const removable = visibleTasks(ctx).filter(
-			(task) => task.enabled === false || ["fired", "cancelled", "failed"].includes(task.status),
-		);
+	function cleanupVisibleTasks(current: ScheduledTask[], ctx: ExtensionContext): ScheduledTask[] {
+		const removable = current
+			.filter((task) => taskBelongsToSession(task, ctx))
+			.filter((task) => task.enabled === false || ["fired", "cancelled", "failed"].includes(task.status));
 		const removableIds = new Set(removable.map((task) => task.id));
-		tasks = tasks.filter((task) => !removableIds.has(task.id));
+		current.splice(0, current.length, ...current.filter((task) => !removableIds.has(task.id)));
 		for (const task of removable) clearHandle(task.id);
 		return removable;
 	}
@@ -441,11 +502,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		id: string,
 		mutator: (visible: ScheduledTask[]) => ScheduledTask,
 	): Promise<ScheduledTask> {
-		await loadTasks();
-		const visible = visibleTasks(ctx);
-		const task = mutator(visible);
-		await saveTasks();
-		rescheduleAll(ctx);
+		const task = await transactTasks((current) => {
+			const visible = current.filter((candidate) => taskBelongsToSession(candidate, ctx));
+			return mutator(visible);
+		});
+		rescheduleAll();
 		return task;
 	}
 
@@ -460,22 +521,20 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		activeCtx = ctx;
 		const generation = ++sessionGeneration;
-		await loadTasks();
+		const interrupted = await transactTasks((current) =>
+			core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive }),
+		);
 		if (!isSessionActive(ctx, generation)) return;
 
-		const interrupted = core.recoverInterruptedTasks(tasks, new Date(), { isOwnerActive: isRunOwnerActive });
-		if (interrupted.length > 0) {
-			await saveTasks();
-			if (!isSessionActive(ctx, generation)) return;
-			if (ctx.hasUI) {
-				ctx.ui.notify(
-					`Recovered ${interrupted.length} task(s) interrupted before completion; recurring tasks were rescheduled`,
-					"warning",
-				);
-			}
+		if (interrupted.length > 0 && ctx.hasUI) {
+			ctx.ui.notify(
+				`Recovered ${interrupted.length} task(s) interrupted before completion; recurring tasks were rescheduled`,
+				"warning",
+			);
 		}
 
-		rescheduleAll(ctx, generation);
+		rescheduleAll(generation);
+		startStateRefresh(generation);
 		const catchUpOptions = core.parseCatchUpOptions(process.env);
 		void catchUpOverdueCronTasks(ctx, generation, catchUpOptions).catch((error: any) => {
 			if (isSessionActive(ctx, generation) && ctx.hasUI) {
@@ -485,9 +544,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		if (!isSessionActive(ctx)) return;
 		++sessionGeneration;
 		clearTimers();
+		refreshLoop.stop();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("scheduler", undefined);
 			ctx.ui.setWidget("scheduler", undefined);
@@ -591,12 +650,13 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const id = args.trim();
 			try {
-				await loadTasks();
-				const visibleRemoved = core.removeScheduledTask(visibleTasks(ctx), id);
-				const removed = core.removeScheduledTask(tasks, visibleRemoved.id);
+				const removed = await transactTasks((current) => {
+					const visible = current.filter((task) => taskBelongsToSession(task, ctx));
+					const visibleRemoved = core.removeScheduledTask(visible, id);
+					return core.removeScheduledTask(current, visibleRemoved.id);
+				});
 				clearHandle(removed.id);
-				await saveTasks();
-				rescheduleAll(ctx);
+				rescheduleAll();
 				ctx.ui.notify(`Removed scheduled task ${removed.id}`, "info");
 			} catch (error: any) {
 				ctx.ui.notify(error?.message ?? String(error), "error");
@@ -607,10 +667,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	pi.registerCommand("schedule-cleanup", {
 		description: "Remove disabled/completed/cancelled/failed scheduled tasks visible to this session",
 		handler: async (_args, ctx) => {
-			await loadTasks();
-			const removed = cleanupVisibleTasks(ctx);
-			await saveTasks();
-			rescheduleAll(ctx);
+			const removed = await transactTasks((current) => cleanupVisibleTasks(current, ctx));
+			rescheduleAll();
 			ctx.ui.notify(`Cleaned up ${removed.length} scheduled task(s)`, "info");
 		},
 	});
@@ -767,41 +825,39 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			failurePrompt: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			await loadTasks();
 			if (params.action === "cleanup") {
-				const removed = cleanupVisibleTasks(ctx);
-				await saveTasks();
-				rescheduleAll(ctx);
+				const removed = await transactTasks((current) => cleanupVisibleTasks(current, ctx));
+				rescheduleAll();
 				return { content: [{ type: "text", text: `Cleaned up ${removed.length} scheduled task(s).` }], details: { removed } };
 			}
 
 			if (!params.id) throw new Error("id is required for this management action");
-			let task: ScheduledTask;
-			if (params.action === "enable") {
-				task = core.enableScheduledTask(visibleTasks(ctx), params.id, new Date());
-			} else if (params.action === "disable") {
-				task = core.disableScheduledTask(visibleTasks(ctx), params.id, new Date());
-			} else if (params.action === "remove") {
-				const visibleRemoved = core.removeScheduledTask(visibleTasks(ctx), params.id);
-				task = core.removeScheduledTask(tasks, visibleRemoved.id);
-				clearHandle(task.id);
-			} else {
+			const task = await transactTasks((current) => {
+				const visible = current.filter((candidate) => taskBelongsToSession(candidate, ctx));
+				if (params.action === "enable") {
+					return core.enableScheduledTask(visible, params.id, new Date());
+				}
+				if (params.action === "disable") {
+					return core.disableScheduledTask(visible, params.id, new Date());
+				}
+				if (params.action === "remove") {
+					const visibleRemoved = core.removeScheduledTask(visible, params.id);
+					return core.removeScheduledTask(current, visibleRemoved.id);
+				}
+
 				const updates: Record<string, any> = { ...params };
 				delete updates.action;
 				delete updates.id;
 				if (updates.scope === "session") {
 					updates.sessionFile = currentSessionFile(ctx);
-					if (!updates.sessionFile) {
-						throw new Error("Session-scoped tasks require a persisted Pi session");
-					}
+					if (!updates.sessionFile) throw new Error("Session-scoped tasks require a persisted Pi session");
 				} else if (updates.scope !== undefined) {
 					updates.sessionFile = null;
 				}
-				task = core.updateScheduledTask(visibleTasks(ctx), params.id, updates, new Date());
-			}
-
-			await saveTasks();
-			rescheduleAll(ctx);
+				return core.updateScheduledTask(visible, params.id, updates, new Date());
+			});
+			if (params.action === "remove") clearHandle(task.id);
+			rescheduleAll();
 			return {
 				content: [{ type: "text", text: `${params.action} scheduled task ${task.id}` }],
 				details: { task, pending: core.pendingTasks(tasks) },
