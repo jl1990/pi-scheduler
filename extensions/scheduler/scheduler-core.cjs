@@ -23,6 +23,7 @@ const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "fai
 const VALID_LAST_STATUSES = new Set(["success", "error", "running"]);
 const VALID_SCOPES = new Set(["session", "cwd", "global"]);
 const VALID_WAKE_ON = new Set(["always", "failure", "success", "never"]);
+const VALID_STOP_ON = new Set(["success", "failure", "never"]);
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -194,6 +195,12 @@ function normalizeWakeOn(wakeOn, hasPrompt = false) {
 	return value;
 }
 
+function normalizeStopOn(stopOn) {
+	const value = compactSpaces(stopOn || "never").toLowerCase();
+	if (!VALID_STOP_ON.has(value)) throw new Error(`Invalid stopOn value: ${value}`);
+	return value;
+}
+
 function normalizeMaxRuns(value) {
 	if (value === undefined || value === null || value === "") return undefined;
 	const n = Number(value);
@@ -311,6 +318,7 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 	const validated = validateTaskSchedule(type, schedule, now);
 	const enabled = input.enabled === undefined ? true : Boolean(input.enabled);
 	const hasShellPrompt = Boolean(input.followUpPrompt || input.successPrompt || input.failurePrompt);
+	if (input.stopOn !== undefined && action !== "shell") throw new Error("stopOn is only supported for shell scheduled tasks");
 
 	const task = {
 		id: idFn(now),
@@ -357,6 +365,7 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 		if (successPrompt) task.successPrompt = successPrompt;
 		if (failurePrompt) task.failurePrompt = failurePrompt;
 		task.wakeOn = normalizeWakeOn(input.wakeOn, hasShellPrompt);
+		task.stopOn = normalizeStopOn(input.stopOn);
 	} else if (action === "message") {
 		if (!message) throw new Error("message is required for message scheduled tasks");
 		task.message = message;
@@ -431,6 +440,18 @@ function normalizeTask(task, nowValue = new Date()) {
 		} catch {
 			migrated.wakeOn = hasShellPrompt ? "always" : "never";
 		}
+		try {
+			migrated.stopOn = normalizeStopOn(task.stopOn);
+		} catch (error) {
+			migrated.stopOn = "never";
+			migrated.enabled = false;
+			migrated.status = "failed";
+			migrated.nextRun = undefined;
+			migrated.lastStatus = "error";
+			migrated.lastError = error.message;
+		}
+	} else {
+		delete migrated.stopOn;
 	}
 
 	return migrated;
@@ -551,6 +572,7 @@ function enableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled" || task.status === "failed" || task.status === "fired") task.status = "pending";
+	delete task.stopReason;
 	task.enabled = true;
 	const validated = validateTaskSchedule(task.type ?? "once", task.schedule ?? task.whenText ?? task.dueAt, nowValue);
 	task.type = validated.type;
@@ -573,7 +595,9 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 
-	if (updates.action !== undefined) task.action = normalizeAction(updates.action);
+	const nextAction = updates.action !== undefined ? normalizeAction(updates.action) : task.action;
+	if (updates.stopOn !== undefined && nextAction !== "shell") throw new Error("stopOn is only supported for shell scheduled tasks");
+	if (updates.action !== undefined) task.action = nextAction;
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
 	if (updates.enabled !== undefined) task.enabled = Boolean(updates.enabled);
@@ -589,6 +613,11 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.successPrompt !== undefined) task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
 	if (updates.failurePrompt !== undefined) task.failurePrompt = compactSpaces(updates.failurePrompt) || undefined;
 	if (updates.wakeOn !== undefined) task.wakeOn = normalizeWakeOn(updates.wakeOn, true);
+	if (updates.stopOn !== undefined) {
+		task.stopOn = normalizeStopOn(updates.stopOn);
+		delete task.stopReason;
+	}
+	if (updates.action !== undefined && task.action !== "shell") delete task.stopOn;
 	if (updates.prompt !== undefined) task.prompt = compactSpaces(updates.prompt);
 	if (updates.message !== undefined) task.message = compactSpaces(updates.message);
 	if (updates.command !== undefined) task.command = compactSpaces(updates.command);
@@ -636,9 +665,12 @@ function finishTaskAfterRun(task, now, ok, result) {
 	if (result !== undefined) task.result = result;
 
 	const reachedMaxRuns = task.maxRuns !== undefined && task.runCount >= task.maxRuns;
-	if (task.type === "once" || reachedMaxRuns) {
+	const stopOn = task.action === "shell" ? normalizeStopOn(task.stopOn) : "never";
+	const stoppedOnResult = stopOn !== "never" && ((stopOn === "success" && ok) || (stopOn === "failure" && !ok));
+	if (task.type === "once" || reachedMaxRuns || (!remainDisabled && stoppedOnResult)) {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
+		if (stoppedOnResult) task.stopReason = `Stopped because stopOn=${stopOn} matched the ${ok ? "successful" : "failed"} shell result`;
 		task.firedAt = ok ? now.toISOString() : task.firedAt;
 		task.failedAt = ok ? task.failedAt : now.toISOString();
 		task.nextRun = undefined;
@@ -676,7 +708,10 @@ function markScheduledTaskCompleted(tasks, idOrPrefix, nowValue = new Date(), re
 		delete task.startedAt;
 		return task;
 	}
-	return finishTaskAfterRun(task, now, options.ok !== false, result);
+	const ok = options.ok === undefined
+		? (task.action === "shell" ? shellResultOk(result) : true)
+		: options.ok !== false;
+	return finishTaskAfterRun(task, now, ok, result);
 }
 
 function markScheduledTaskFired(tasks, idOrPrefix, nowValue = new Date(), result) {
@@ -815,6 +850,7 @@ module.exports = {
 	VALID_STATUSES,
 	VALID_SCOPES,
 	VALID_WAKE_ON,
+	VALID_STOP_ON,
 	SECOND,
 	MINUTE,
 	HOUR,
@@ -827,6 +863,7 @@ module.exports = {
 	normalizeType,
 	normalizeScope,
 	normalizeWakeOn,
+	normalizeStopOn,
 	generateId,
 	createScheduledTask,
 	normalizeTask,

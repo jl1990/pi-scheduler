@@ -17,6 +17,7 @@ const ACTIONS = ["notify", "prompt", "shell", "message"] as const;
 const TYPES = ["once", "interval", "cron"] as const;
 const SCOPES = ["session", "cwd", "global"] as const;
 const WAKE_ON = ["always", "failure", "success", "never"] as const;
+const STOP_ON = ["success", "failure", "never"] as const;
 const MANAGE_ACTIONS = ["enable", "disable", "remove", "update", "cleanup"] as const;
 
 const STATE_FILE = process.env.PI_SCHEDULER_STATE_FILE || join(homedir(), ".pi", "agent", "state", "scheduler", "tasks.json");
@@ -728,6 +729,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "Working directory for shell actions; defaults to current cwd." })),
 			timeoutMs: Type.Optional(Type.Number({ description: "Shell timeout in milliseconds.", minimum: 1000 })),
 			wakeOn: Type.Optional(StringEnum(WAKE_ON, { description: "For shell actions: when to wake the agent. Default always if a prompt is configured, otherwise never." })),
+			stopOn: Type.Optional(StringEnum(STOP_ON, { description: "For shell actions: disable a recurring task after a matching result. Default never." })),
 			followUpPrompt: Type.Optional(
 				Type.String({ description: "For shell actions: generic follow-up instruction sent with stdout/stderr." }),
 			),
@@ -820,6 +822,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			command: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ minimum: 1000 })),
 			wakeOn: Type.Optional(StringEnum(WAKE_ON)),
+			stopOn: Type.Optional(StringEnum(STOP_ON)),
 			followUpPrompt: Type.Optional(Type.String()),
 			successPrompt: Type.Optional(Type.String()),
 			failurePrompt: Type.Optional(Type.String()),
