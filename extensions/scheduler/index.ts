@@ -327,19 +327,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			const message = task.message ?? "Scheduled reminder";
 			if (ctx.hasUI) ctx.ui.notify(message, "info");
 			recordMessage(`🔔 ${message}`, { task }, false);
-			return { ok: true, delivered: "notify" };
+			return { ok: true, delivered: "notify", wakeReason: "notify", wakeDisposition: "not-requested" };
 		}
 
 		if (task.action === "prompt") {
 			const prompt = `${scheduledPromptHeader(task)}${task.prompt}`;
 			sendAgentPrompt(pi, ctx, prompt);
-			return { ok: true, delivered: "prompt" };
+			return { ok: true, delivered: "prompt", wakeReason: "prompt", wakeDisposition: "delivered" };
 		}
 
 		if (task.action === "message") {
 			const message = task.message ?? "Scheduled message";
 			recordMessage(`⏰ ${message}`, { task }, task.triggerTurn !== false);
-			return { ok: true, delivered: "message", triggerTurn: task.triggerTurn !== false };
+			return { ok: true, delivered: "message", triggerTurn: task.triggerTurn !== false, wakeReason: "message", wakeDisposition: task.triggerTurn !== false ? "delivered" : "not-requested" };
 		}
 
 		if (task.action === "shell") {
@@ -348,7 +348,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`Running scheduled command: ${task.command}`, "info");
 
 			const result = await pi.exec("bash", ["-lc", task.command], { cwd, timeout });
-			const shellResult = {
+			const shellResult: Record<string, any> = {
 				ok: result.code === 0 && result.killed !== true,
 				command: task.command,
 				cwd,
@@ -359,7 +359,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				stderr: truncateMiddle(result.stderr ?? "", MAX_STORED_OUTPUT_CHARS),
 			};
 
-			if (!isActive()) return { ...shellResult, outputSuppressed: true };
+			if (!isActive()) return { ...shellResult, outputSuppressed: true, wakeReason: task.wakeOn ?? "never", wakeDisposition: "session-suppressed" };
 
 			recordMessage(
 				`🖥️ Scheduled command ${task.id} finished with exit code ${result.code}: ${task.command}`,
@@ -367,9 +367,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				false,
 			);
 
+			shellResult.wakeReason = task.wakeOn ?? "never";
+			shellResult.wakeDisposition = "suppressed";
 			if (core.shouldWakeForShellResult(task, shellResult)) {
 				const instruction = core.selectShellFollowUpPrompt(task, shellResult);
-				if (instruction) sendAgentPrompt(pi, ctx, shellResultPrompt(task, shellResult, instruction));
+				if (instruction) {
+					try {
+						sendAgentPrompt(pi, ctx, shellResultPrompt(task, shellResult, instruction));
+						shellResult.wakeDisposition = "delivered";
+					} catch (error: any) {
+						shellResult.wakeDisposition = "failed";
+						shellResult.wakeError = String(error?.message ?? error).slice(0, 1000);
+					}
+				} else shellResult.wakeDisposition = "no-followup";
 			}
 
 			return shellResult;
@@ -593,12 +603,14 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("schedules", {
-		description: "List scheduled tasks; pass 'all' to include disabled/completed/cancelled/failed tasks",
+		description: "List scheduled tasks; pass 'all' to include inactive tasks or 'history' for run history",
 		handler: async (args, ctx) => {
 			await loadTasks();
-			const includeAll = args.trim().toLowerCase() === "all";
+			const view = args.trim().toLowerCase();
+			const includeAll = view === "all" || view === "history";
+			const includeHistory = view === "history";
 			const visible = visibleTasks(ctx);
-			recordMessage(core.formatTaskList(visible, new Date(), { includeAll }), { includeAll, tasks: visible }, false);
+			recordMessage(core.formatTaskList(visible, new Date(), { includeAll, includeHistory }), { includeAll, includeHistory, tasks: visible }, false);
 			updateStatus(ctx);
 		},
 	});
@@ -773,11 +785,18 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		promptSnippet: "List pending/all scheduled future or recurring actions visible to the current Pi session",
 		parameters: Type.Object({
 			includeAll: Type.Optional(Type.Boolean({ description: "Include disabled, fired, cancelled, and failed tasks. Default false." })),
+			includeHistory: Type.Optional(Type.Boolean({ description: "Include compact per-run history. Default false." })),
+			id: Type.Optional(Type.String({ description: "Show history for one task id or prefix." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await loadTasks();
-			const visible = visibleTasks(ctx);
-			const text = core.formatTaskList(visible, new Date(), { includeAll: Boolean(params.includeAll) });
+			let visible = visibleTasks(ctx);
+			if (params.id) {
+				const matches = visible.filter((task) => task.id === params.id || task.id.startsWith(params.id));
+				if (matches.length !== 1) throw new Error(`Scheduled task not found or prefix is ambiguous: ${params.id}`);
+				visible = matches;
+			}
+			const text = core.formatTaskList(visible, new Date(), { includeAll: Boolean(params.includeAll || params.id || params.includeHistory), includeHistory: Boolean(params.includeHistory) });
 			updateStatus(ctx);
 			return { content: [{ type: "text", text }], details: { tasks: visible } };
 		},

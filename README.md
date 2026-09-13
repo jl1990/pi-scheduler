@@ -84,9 +84,12 @@ Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `fo
 
 Ask Pi to list, update, disable, or remove tasks. Its tools are `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task`, and `manage_scheduled_task`.
 
+Completed runs keep a compact history of the latest 10 attempts (timestamps, duration, outcome, and wake disposition). Use `list_scheduled_tasks` with `includeHistory: true` (and optionally `id`) to inspect it; the default listing remains compact.
+
 ```text
 /schedules                       # active tasks
-/schedules all                   # include history
+/schedules all                   # include inactive tasks
+/schedules history               # show compact run history
 /schedule-cancel <id-or-prefix>
 /schedule-enable <id-or-prefix>
 /schedule-disable <id-or-prefix>

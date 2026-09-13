@@ -1,5 +1,6 @@
 const { realpathSync } = require("node:fs");
 const { createRequire } = require("node:module");
+const { randomUUID } = require("node:crypto");
 
 function loadCroner() {
 	try {
@@ -31,6 +32,41 @@ const DAY = 24 * HOUR;
 const WEEK = 7 * DAY;
 const DEFAULT_CATCHUP_WINDOW_HOURS = 24;
 const DEFAULT_CATCHUP_MAX_FIRE = 5;
+const DEFAULT_HISTORY_LIMIT = 10;
+
+function normalizeRunHistory(value) {
+	if (!Array.isArray(value)) return undefined;
+	const valid = new Map();
+	for (const entry of value) {
+		if (!entry || typeof entry.attemptId !== "string" || !entry.attemptId || entry.attemptId.length > 128
+			|| !Number.isFinite(Date.parse(entry.startedAt)) || !Number.isFinite(Date.parse(entry.completedAt))
+			|| !Number.isSafeInteger(entry.durationMs) || entry.durationMs < 0
+			|| !["success", "error", "cancelled", "interrupted"].includes(entry.outcome?.status)) continue;
+		const outcome = { status: entry.outcome.status, killed: entry.outcome.killed === true };
+		if (Number.isSafeInteger(entry.outcome.exitCode)) outcome.exitCode = entry.outcome.exitCode;
+		if (typeof entry.outcome.error === "string") outcome.error = entry.outcome.error.slice(0, 1000);
+		const clean = { attemptId: entry.attemptId, startedAt: new Date(entry.startedAt).toISOString(), completedAt: new Date(entry.completedAt).toISOString(), durationMs: entry.durationMs, outcome };
+		if (typeof entry.wakeReason === "string") clean.wakeReason = entry.wakeReason.slice(0, 120);
+		if (["delivered", "suppressed", "failed", "no-followup", "session-suppressed", "not-requested"].includes(entry.wakeDisposition)) clean.wakeDisposition = entry.wakeDisposition;
+		if (typeof entry.wakeError === "string") clean.wakeError = entry.wakeError.slice(0, 1000);
+		valid.set(clean.attemptId, clean);
+	}
+	return [...valid.values()].slice(-DEFAULT_HISTORY_LIMIT);
+}
+
+function appendRunHistory(task, now, result = {}, status) {
+	const attemptId = task.runAttemptId ?? task.runOwner?.attemptId ?? (task.startedAt ? `legacy-${task.startedAt}` : undefined);
+	if (!attemptId || !task.startedAt) return;
+	const history = normalizeRunHistory(task.history) ?? [];
+	if (history.some((entry) => entry.attemptId === attemptId)) return;
+	const entry = {
+		attemptId, startedAt: task.startedAt, completedAt: now.toISOString(),
+		durationMs: Math.max(0, now.getTime() - Date.parse(task.startedAt)),
+		outcome: { status, exitCode: result?.code, killed: result?.killed, error: result?.error },
+		wakeReason: result?.wakeReason, wakeDisposition: result?.wakeDisposition, wakeError: result?.wakeError,
+	};
+	task.history = normalizeRunHistory([...history, entry]);
+}
 
 function asDate(value) {
 	const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
@@ -397,6 +433,9 @@ function normalizeTask(task, nowValue = new Date()) {
 	if (!schedule) return undefined;
 
 	const migrated = { ...task, action, type, schedule, status };
+	const history = normalizeRunHistory(task.history);
+	if (history?.length) migrated.history = history;
+	else delete migrated.history;
 	migrated.enabled = task.enabled === undefined ? !isTerminal(migrated) : Boolean(task.enabled);
 	migrated.runCount = Number.isInteger(task.runCount) && task.runCount >= 0 ? task.runCount : 0;
 	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : task.sessionFile ? "session" : task.cwd ? "cwd" : "global";
@@ -623,11 +662,16 @@ function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date(), opti
 	task.lastStatus = "running";
 	task.startedAt = now.toISOString();
 	if (options.runOwner) task.runOwner = { ...options.runOwner, startedAt: now.toISOString() };
+	task.runAttemptId = options.runOwner?.attemptId ?? randomUUID();
 	return task;
 }
 
 function finishTaskAfterRun(task, now, ok, result) {
 	const remainDisabled = task.enabled === false;
+	appendRunHistory(task, now, result, result?.interrupted ? "interrupted" : (ok ? "success" : "error"));
+	delete task.interruptedRun;
+	delete task.startedAt;
+	delete task.runAttemptId;
 	delete task.runOwner;
 	task.runCount = (Number.isInteger(task.runCount) ? task.runCount : 0) + 1;
 	task.lastRun = now.toISOString();
@@ -672,11 +716,16 @@ function markScheduledTaskCompleted(tasks, idOrPrefix, nowValue = new Date(), re
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled") {
+		appendRunHistory(task, now, result, "cancelled");
 		delete task.runOwner;
 		delete task.startedAt;
+		delete task.runAttemptId;
 		return task;
 	}
-	return finishTaskAfterRun(task, now, options.ok !== false, result);
+	const historyResult = result && typeof result === "object" ? { ...result } : result;
+	if (historyResult && options.wakeReason !== undefined) historyResult.wakeReason = options.wakeReason;
+	if (historyResult && options.wakeDisposition !== undefined) historyResult.wakeDisposition = options.wakeDisposition;
+	return finishTaskAfterRun(task, now, options.ok !== false, historyResult);
 }
 
 function markScheduledTaskFired(tasks, idOrPrefix, nowValue = new Date(), result) {
@@ -687,12 +736,14 @@ function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled") {
+		appendRunHistory(task, asDate(nowValue), {error: error instanceof Error ? error.message : String(error), wakeReason: "execution-error", wakeDisposition: "not-requested"}, "cancelled");
 		delete task.runOwner;
 		delete task.startedAt;
+		delete task.runAttemptId;
 		return task;
 	}
 	task.lastError = error instanceof Error ? error.message : String(error);
-	return finishTaskAfterRun(task, asDate(nowValue), false, undefined);
+	return finishTaskAfterRun(task, asDate(nowValue), false, { error: task.lastError, interrupted: task.interruptedRun, wakeReason: task.interruptedRun ? "interrupted" : "execution-error", wakeDisposition: "not-requested" });
 }
 
 function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
@@ -708,10 +759,13 @@ function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
 			task.lastStatus = "error";
 			task.lastError = error.message;
 			task.nextRun = undefined;
+			appendRunHistory(task, now, {error: error.message, wakeReason: "interrupted", wakeDisposition: "not-requested"}, "interrupted");
 			delete task.runOwner;
 			delete task.startedAt;
+			delete task.runAttemptId;
 			continue;
 		}
+		task.interruptedRun = true;
 		markScheduledTaskFailed(tasks, task.id, now, error);
 	}
 	return interrupted;
@@ -806,7 +860,14 @@ function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 	const list = options.includeAll ? tasks.slice().sort(sortByNextRun) : pendingTasks(tasks);
 	if (list.length === 0) return options.includeAll ? "No scheduled tasks." : "No active scheduled tasks.";
 	const title = options.includeAll ? "Scheduled tasks:" : "Active scheduled tasks:";
-	return [title, ...list.map((task) => formatTaskLine(task, nowValue))].join("\n");
+	const lines = [title];
+	for (const task of list) {
+		lines.push(formatTaskLine(task, nowValue));
+		if (options.includeHistory && task.history?.length) {
+			for (const run of task.history) lines.push(`  · ${run.attemptId} ${run.outcome?.status ?? "unknown"} ${run.completedAt} (${run.durationMs}ms)${run.wakeDisposition ? ` wake=${run.wakeDisposition}` : ""}`);
+		}
+	}
+	return lines.join("\n");
 }
 
 module.exports = {
