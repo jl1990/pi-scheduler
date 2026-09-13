@@ -31,6 +31,8 @@ const {
 	normalizeStopOn,
 	VALID_STOP_ON,
 	formatAbsoluteTime,
+	expireOverdueTasks,
+	canClaimTask,
 } = require("../extensions/scheduler/scheduler-core.cjs");
 
 const NOW = new Date(2026, 6, 5, 12, 0, 0, 0);
@@ -239,6 +241,70 @@ test("createScheduledTask validates action payloads and task metadata", () => {
 	assert.throws(() => createScheduledTask({ action: "prompt", whenText: "5m" }, NOW), /prompt is required/);
 	assert.throws(() => createScheduledTask({ action: "shell", whenText: "5m" }, NOW), /command is required/);
 	assert.throws(() => createScheduledTask({ action: "notify", whenText: "5m", message: "x", maxRuns: 0 }, NOW), /maxRuns/);
+});
+
+test("task expiry is persisted as an absolute deadline and rejects non-positive durations", () => {
+	const now = new Date("2026-07-05T12:00:00.000Z");
+	const task = createScheduledTask({ action: "notify", whenText: "5m", message: "A", expiresIn: "1h" }, now, () => "expiry");
+	assert.equal(task.expiresAt, "2026-07-05T13:00:00.000Z");
+	assert.throws(() => createScheduledTask({ action: "notify", whenText: "5m", message: "A", expiresIn: "0m" }, now), /expiresIn/);
+	assert.throws(() => createScheduledTask({ action: "notify", whenText: "5m", message: "A", expiresIn: "nope" }, now), /expiresIn/);
+});
+
+test("expired pending tasks become distinguishable disabled tasks and cannot be enabled without renewal", () => {
+	const created = createScheduledTask({ action: "notify", whenText: "5m", message: "A", expiresIn: "10m" }, NOW, () => "expiry");
+	const tasks = [created];
+	const expired = expireOverdueTasks(tasks, new Date(NOW.getTime() + 11 * 60_000));
+	assert.equal(expired.length, 1);
+	assert.equal(created.status, "expired");
+	assert.equal(created.enabled, false);
+	assert.throws(() => enableScheduledTask(tasks, "expiry", new Date(NOW.getTime() + 11 * 60_000)), /renew|expired/i);
+	updateScheduledTask(tasks, "expiry", { expiresIn: "1h", enabled: true }, new Date(NOW.getTime() + 11 * 60_000));
+	assert.equal(created.status, "pending");
+	assert.equal(created.enabled, true);
+	assert.equal(created.expiresAt, new Date(NOW.getTime() + 71 * 60_000).toISOString());
+});
+
+test("claim deadline helper rejects a task at or after expiry", () => {
+	const task = createScheduledTask({ action: "notify", whenText: "5m", message: "A", expiresIn: "10m" }, NOW, () => "expiry");
+	assert.equal(canClaimTask(task, new Date(NOW.getTime() + 9 * 60_000)), true);
+	assert.equal(canClaimTask(task, new Date(NOW.getTime() + 10 * 60_000)), false);
+});
+
+test("expiry is strict at the boundary and never blocks a run before its due time", () => {
+	const now = new Date("2026-07-05T12:00:00.000Z");
+	const task = createScheduledTask({ action: "notify", whenText: "1h", message: "A", expiresIn: "2h" }, now, () => "boundary");
+	assert.equal(canClaimTask(task, new Date("2026-07-05T13:59:59.999Z")), true);
+	assert.equal(canClaimTask(task, new Date("2026-07-05T14:00:00.000Z")), false);
+	assert.equal(dueTasks([task], new Date("2026-07-05T12:59:59.999Z")).length, 0);
+	assert.equal(expireOverdueTasks([task], new Date("2026-07-05T12:59:59.999Z")).length, 0);
+});
+
+test("disabled tasks expire by deadline, while cancellation remains cancellation", () => {
+	const now = new Date("2026-07-05T12:00:00.000Z");
+	const disabled = createScheduledTask({ action: "notify", whenText: "1h", message: "A", expiresIn: "10m", enabled: false }, now, () => "disabled-expiry");
+	const cancelled = createScheduledTask({ action: "notify", whenText: "1h", message: "B", expiresIn: "10m" }, now, () => "cancelled-expiry");
+	const tasks = [disabled, cancelled];
+	cancelScheduledTask(tasks, "cancelled-expiry", now);
+	expireOverdueTasks(tasks, new Date("2026-07-05T12:11:00.000Z"));
+	assert.equal(disabled.status, "expired");
+	assert.equal(cancelled.status, "cancelled");
+	assert.throws(() => enableScheduledTask(tasks, "disabled-expiry", new Date("2026-07-05T12:11:00.000Z")), /renew|expired/i);
+});
+
+test("expiry can be renewed or cleared, and an in-flight run is allowed to finish", () => {
+	const now = new Date("2026-07-05T12:00:00.000Z");
+	const task = createScheduledTask({ action: "prompt", type: "interval", schedule: "5m", prompt: "A", expiresIn: "10m" }, now, () => "running-expiry");
+	const tasks = [task];
+	markScheduledTaskRunning(tasks, task.id, new Date("2026-07-05T12:05:00.000Z"));
+	assert.equal(expireOverdueTasks(tasks, new Date("2026-07-05T12:11:00.000Z")).length, 0);
+	assert.equal(task.status, "running");
+	updateScheduledTask(tasks, task.id, { expiresIn: "1h" }, new Date("2026-07-05T12:11:00.000Z"));
+	assert.equal(task.status, "running");
+	markScheduledTaskCompleted(tasks, task.id, new Date("2026-07-05T12:12:00.000Z"), { ok: true });
+	assert.equal(task.status, "pending");
+	updateScheduledTask(tasks, task.id, { expiresIn: null }, new Date("2026-07-05T12:13:00.000Z"));
+	assert.equal(task.expiresAt, undefined);
 });
 
 test("sanitizeTasks migrates current one-shot task records", () => {

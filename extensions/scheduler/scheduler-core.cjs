@@ -1,5 +1,6 @@
 const { realpathSync } = require("node:fs");
 const { createRequire } = require("node:module");
+const { createHash, randomUUID } = require("node:crypto");
 
 function loadCroner() {
 	try {
@@ -19,10 +20,10 @@ const { Cron } = loadCroner();
 
 const VALID_ACTIONS = new Set(["notify", "prompt", "shell", "message"]);
 const VALID_TYPES = new Set(["once", "interval", "cron"]);
-const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed"]);
+const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed", "expired"]);
 const VALID_LAST_STATUSES = new Set(["success", "error", "running"]);
 const VALID_SCOPES = new Set(["session", "cwd", "global"]);
-const VALID_WAKE_ON = new Set(["always", "failure", "success", "never"]);
+const VALID_WAKE_ON = new Set(["always", "failure", "success", "never", "change"]);
 const VALID_STOP_ON = new Set(["success", "failure", "never"]);
 
 const SECOND = 1000;
@@ -32,6 +33,41 @@ const DAY = 24 * HOUR;
 const WEEK = 7 * DAY;
 const DEFAULT_CATCHUP_WINDOW_HOURS = 24;
 const DEFAULT_CATCHUP_MAX_FIRE = 5;
+const DEFAULT_HISTORY_LIMIT = 10;
+
+function normalizeRunHistory(value) {
+	if (!Array.isArray(value)) return undefined;
+	const valid = new Map();
+	for (const entry of value) {
+		if (!entry || typeof entry.attemptId !== "string" || !entry.attemptId || entry.attemptId.length > 128
+			|| !Number.isFinite(Date.parse(entry.startedAt)) || !Number.isFinite(Date.parse(entry.completedAt))
+			|| !Number.isSafeInteger(entry.durationMs) || entry.durationMs < 0
+			|| !["success", "error", "cancelled", "interrupted"].includes(entry.outcome?.status)) continue;
+		const outcome = { status: entry.outcome.status, killed: entry.outcome.killed === true };
+		if (Number.isSafeInteger(entry.outcome.exitCode)) outcome.exitCode = entry.outcome.exitCode;
+		if (typeof entry.outcome.error === "string") outcome.error = entry.outcome.error.slice(0, 1000);
+		const clean = { attemptId: entry.attemptId, startedAt: new Date(entry.startedAt).toISOString(), completedAt: new Date(entry.completedAt).toISOString(), durationMs: entry.durationMs, outcome };
+		if (typeof entry.wakeReason === "string") clean.wakeReason = entry.wakeReason.slice(0, 120);
+		if (["delivered", "pending", "suppressed", "failed", "no-followup", "session-suppressed", "not-requested"].includes(entry.wakeDisposition)) clean.wakeDisposition = entry.wakeDisposition;
+		if (typeof entry.wakeError === "string") clean.wakeError = entry.wakeError.slice(0, 1000);
+		valid.set(clean.attemptId, clean);
+	}
+	return [...valid.values()].slice(-DEFAULT_HISTORY_LIMIT);
+}
+
+function appendRunHistory(task, now, result = {}, status) {
+	const attemptId = task.runAttemptId ?? task.runOwner?.attemptId ?? (task.startedAt ? `legacy-${task.startedAt}` : undefined);
+	if (!attemptId || !task.startedAt) return;
+	const history = normalizeRunHistory(task.history) ?? [];
+	if (history.some((entry) => entry.attemptId === attemptId)) return;
+	const entry = {
+		attemptId, startedAt: task.startedAt, completedAt: now.toISOString(),
+		durationMs: Math.max(0, now.getTime() - Date.parse(task.startedAt)),
+		outcome: { status, exitCode: result?.code, killed: result?.killed, error: result?.error },
+		wakeReason: result?.wakeReason, wakeDisposition: result?.wakeDisposition, wakeError: result?.wakeError,
+	};
+	task.history = normalizeRunHistory([...history, entry]);
+}
 
 function asDate(value) {
 	const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
@@ -215,6 +251,29 @@ function validateTimeoutMs(value) {
 	return Math.round(n);
 }
 
+function normalizeBackoff(value, baseIntervalMs, nowValue = new Date()) {
+	if (value === undefined || value === null) return undefined;
+	if (!Number.isFinite(baseIntervalMs) || baseIntervalMs <= 0) throw new Error("backoff requires an interval schedule");
+	if (!value || typeof value !== "object") throw new Error("backoff must be an object");
+	const factor = Number(value.factor);
+	if (!Number.isFinite(factor) || factor <= 1) throw new Error("backoff.factor must be a finite number greater than 1");
+	const maxIntervalMs = typeof value.maxInterval === "string" ? parseDurationMs(value.maxInterval) : Number(value.maxIntervalMs ?? value.maxInterval);
+	if (!Number.isSafeInteger(maxIntervalMs) || maxIntervalMs < baseIntervalMs) throw new Error("backoff.maxInterval must be at least the base interval");
+	if (!Number.isFinite(new Date(asDate(nowValue).getTime() + maxIntervalMs).getTime())) throw new Error("backoff maxInterval exceeds the supported date range");
+	const current = value.currentIntervalMs === undefined ? baseIntervalMs : Number(value.currentIntervalMs);
+	if (!Number.isSafeInteger(current) || current < baseIntervalMs || current > maxIntervalMs) throw new Error("backoff current interval is invalid");
+	return { factor, maxIntervalMs, currentIntervalMs: current };
+}
+
+function expiryAtFromInput(value, nowValue = new Date()) {
+	const duration = typeof value === "string" ? parseDurationMs(value) : null;
+	const deadline = asDate(nowValue).getTime() + duration;
+	if (!Number.isSafeInteger(duration) || duration <= 0 || !Number.isFinite(new Date(deadline).getTime())) {
+		throw new Error("expiresIn must be a positive duration within the supported date range");
+	}
+	return new Date(deadline).toISOString();
+}
+
 function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 	const now = asDate(nowValue);
 	const type = normalizeType(typeValue);
@@ -336,12 +395,14 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 	};
 
 	if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+	if (input.backoff !== undefined) task.backoff = normalizeBackoff(input.backoff, validated.intervalMs, now);
 	if (input.title !== undefined) task.title = compactSpaces(input.title);
 	if (input.name !== undefined) task.name = compactSpaces(input.name);
 	if (input.description !== undefined) task.description = compactSpaces(input.description);
 	if (input.cwd) task.cwd = String(input.cwd);
 	if (input.sessionFile) task.sessionFile = String(input.sessionFile);
 	if (input.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(input.maxRuns);
+	if (input.expiresIn !== undefined) task.expiresAt = expiryAtFromInput(input.expiresIn, now);
 
 	const message = compactSpaces(input.message ?? input.payload ?? "");
 	const prompt = compactSpaces(input.prompt ?? input.payload ?? input.message ?? "");
@@ -381,7 +442,7 @@ function taskSummary(task) {
 }
 
 function isTerminal(task) {
-	return task.status === "fired" || task.status === "cancelled" || task.status === "failed";
+	return task.status === "fired" || task.status === "cancelled" || task.status === "failed" || task.status === "expired";
 }
 
 function normalizeTask(task, nowValue = new Date()) {
@@ -406,17 +467,43 @@ function normalizeTask(task, nowValue = new Date()) {
 	if (!schedule) return undefined;
 
 	const migrated = { ...task, action, type, schedule, status };
+	const history = normalizeRunHistory(task.history);
+	if (history?.length) migrated.history = history;
+	else delete migrated.history;
 	migrated.enabled = task.enabled === undefined ? !isTerminal(migrated) : Boolean(task.enabled);
 	migrated.runCount = Number.isInteger(task.runCount) && task.runCount >= 0 ? task.runCount : 0;
 	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : task.sessionFile ? "session" : task.cwd ? "cwd" : "global";
 	migrated.whenText = compactSpaces(task.whenText ?? task.when ?? schedule);
 	migrated.createdAt = Number.isNaN(Date.parse(task.createdAt)) ? asDate(nowValue).toISOString() : task.createdAt;
+	if (task.expiresAt !== undefined) {
+		const expiry = Date.parse(task.expiresAt);
+		if (!Number.isFinite(expiry)) {
+			migrated.enabled = false;
+			migrated.status = "failed";
+			migrated.lastStatus = "error";
+			migrated.lastError = "Invalid persisted expiresAt";
+			delete migrated.expiresAt;
+			delete migrated.nextRun;
+		} else migrated.expiresAt = new Date(expiry).toISOString();
+	}
 	if (task.maxRuns !== undefined) migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
 	if (task.lastStatus !== undefined && !VALID_LAST_STATUSES.has(task.lastStatus)) delete migrated.lastStatus;
 
 	try {
 		const validated = validateTaskSchedule(type, schedule, nowValue);
 		if (validated.intervalMs !== undefined) migrated.intervalMs = validated.intervalMs;
+		if (type === "interval" && task.backoff !== undefined) {
+			try {
+				migrated.backoff = normalizeBackoff(task.backoff, validated.intervalMs, nowValue);
+			} catch (error) {
+				delete migrated.backoff;
+				migrated.enabled = false;
+				migrated.status = "failed";
+				migrated.lastStatus = "error";
+				migrated.lastError = error.message;
+				migrated.nextRun = undefined;
+			}
+		} else if (type !== "interval") delete migrated.backoff;
 		if (!task.nextRun && !task.dueAt) {
 			migrated.nextRun = migrated.enabled ? validated.nextRun : undefined;
 			migrated.dueAt = validated.dueAt;
@@ -440,6 +527,11 @@ function normalizeTask(task, nowValue = new Date()) {
 		} catch {
 			migrated.wakeOn = hasShellPrompt ? "always" : "never";
 		}
+		if (typeof migrated.lastResultFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(migrated.lastResultFingerprint)) {
+			delete migrated.lastResultFingerprint;
+		}
+		if (typeof migrated.wakeOnChangeKey !== "string") delete migrated.wakeOnChangeKey;
+		if (typeof migrated.wakeOnChangeRevision !== "string") delete migrated.wakeOnChangeRevision;
 		try {
 			migrated.stopOn = normalizeStopOn(task.stopOn);
 		} catch (error) {
@@ -486,9 +578,31 @@ function pendingTasks(tasks) {
 		.sort(sortByNextRun);
 }
 
+function canClaimTask(task, nowValue = new Date()) {
+	if (task?.expiresAt === undefined) return true;
+	const expiry = Date.parse(task.expiresAt);
+	return Number.isFinite(expiry) && asDate(nowValue).getTime() < expiry;
+}
+
+function expireOverdueTasks(tasks, nowValue = new Date()) {
+	const now = asDate(nowValue);
+	const expired = [];
+	for (const task of tasks) {
+		if (isTerminal(task) || task.status === "running" || !task.expiresAt || !Number.isFinite(Date.parse(task.expiresAt))) continue;
+		if (Date.parse(task.expiresAt) <= now.getTime()) {
+			task.enabled = false;
+			task.status = "expired";
+			task.expiredAt = now.toISOString();
+			task.nextRun = undefined;
+			expired.push(task);
+		}
+	}
+	return expired;
+}
+
 function dueTasks(tasks, nowValue = new Date()) {
 	const now = asDate(nowValue).getTime();
-	return pendingTasks(tasks).filter((task) => task.status === "pending" && Date.parse(task.nextRun ?? task.dueAt) <= now);
+	return pendingTasks(tasks).filter((task) => task.status === "pending" && canClaimTask(task, nowValue) && Date.parse(task.nextRun ?? task.dueAt) <= now);
 }
 
 function parseCatchUpOptions(env = {}) {
@@ -534,7 +648,7 @@ function selectCatchUpCronTasks(tasks, nowValue = new Date(), options = {}) {
 	if (!Number.isFinite(windowMs)) return [];
 
 	return tasks
-		.filter((task) => task.type === "cron" && task.enabled !== false && task.status === "pending")
+		.filter((task) => task.type === "cron" && task.enabled !== false && task.status === "pending" && canClaimTask(task, now))
 		.map((task) => ({ task, missedAt: latestMissedCronRun(task, now) }))
 		.filter((entry) => entry.missedAt && now.getTime() - entry.missedAt.getTime() <= windowMs)
 		.sort((a, b) => b.missedAt.getTime() - a.missedAt.getTime())
@@ -571,6 +685,8 @@ function disableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 function enableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
+	if (task.status === "expired") throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
+	if (!canClaimTask(task, nowValue)) throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
 	if (task.status === "cancelled" || task.status === "failed" || task.status === "fired") task.status = "pending";
 	delete task.stopReason;
 	task.enabled = true;
@@ -578,6 +694,8 @@ function enableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	task.type = validated.type;
 	task.schedule = validated.schedule;
 	if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+	if (task.backoff) task.backoff = normalizeBackoff(task.backoff, validated.intervalMs, nowValue);
+	if (task.backoff) task.backoff.currentIntervalMs = validated.intervalMs;
 	task.nextRun = validated.nextRun;
 	task.dueAt = validated.dueAt;
 	return task;
@@ -594,25 +712,72 @@ function removeScheduledTask(tasks, idOrPrefix) {
 function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
+	const scheduleChanged = updates.schedule !== undefined || updates.when !== undefined || updates.whenText !== undefined || updates.type !== undefined;
+	const resetBackoff = scheduleChanged || updates.backoff !== undefined || updates.enabled === true;
+	let nextBackoff = task.backoff;
+	if (resetBackoff) {
+		const nextType = updates.type !== undefined ? normalizeType(updates.type) : task.type;
+		const nextSchedule = updates.schedule ?? updates.whenText ?? updates.when ?? task.schedule;
+		const validated = validateTaskSchedule(nextType, nextSchedule, nowValue);
+		const input = updates.backoff !== undefined ? updates.backoff : task.backoff;
+		if (input != null && typeof input !== "object") throw new Error("backoff must be an object");
+		nextBackoff = input == null ? undefined : normalizeBackoff({ ...input, currentIntervalMs: undefined }, validated.intervalMs, nowValue);
+	}
+	const renewed = updates.expiresIn !== undefined;
+	const newExpiry = renewed && updates.expiresIn !== null ? expiryAtFromInput(updates.expiresIn, nowValue) : undefined;
+	if (updates.enabled === true && !renewed && (task.status === "expired" || !canClaimTask(task, nowValue))) {
+		throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
+	}
 
 	const nextAction = updates.action !== undefined ? normalizeAction(updates.action) : task.action;
 	if (updates.stopOn !== undefined && nextAction !== "shell") throw new Error("stopOn is only supported for shell scheduled tasks");
+	if (nextAction !== task.action) task.executionRevision = randomUUID();
 	if (updates.action !== undefined) task.action = nextAction;
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
 	if (updates.enabled !== undefined) task.enabled = Boolean(updates.enabled);
+	if (renewed) {
+		if (newExpiry === undefined) delete task.expiresAt;
+		else task.expiresAt = newExpiry;
+		if (task.status === "expired") {
+			task.status = "pending";
+			task.enabled = updates.enabled === undefined ? true : Boolean(updates.enabled);
+			delete task.expiredAt;
+		}
+	}
 	if (updates.name !== undefined) task.name = compactSpaces(updates.name);
 	if (updates.title !== undefined) task.title = compactSpaces(updates.title);
 	if (updates.description !== undefined) task.description = compactSpaces(updates.description);
 	if (updates.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(updates.maxRuns);
-	if (updates.cwd !== undefined) task.cwd = String(updates.cwd);
+	if (updates.cwd !== undefined) {
+		const cwd = String(updates.cwd);
+		if (cwd !== task.cwd) {
+			task.executionRevision = randomUUID();
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.cwd = cwd;
+	}
 	if (updates.sessionFile === null) delete task.sessionFile;
 	else if (updates.sessionFile !== undefined) task.sessionFile = String(updates.sessionFile);
 	if (updates.timeoutMs !== undefined) task.timeoutMs = validateTimeoutMs(updates.timeoutMs);
+	if (resetBackoff) {
+		if (nextBackoff === undefined) delete task.backoff;
+		else task.backoff = nextBackoff;
+	}
 	if (updates.followUpPrompt !== undefined) task.followUpPrompt = compactSpaces(updates.followUpPrompt) || undefined;
 	if (updates.successPrompt !== undefined) task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
 	if (updates.failurePrompt !== undefined) task.failurePrompt = compactSpaces(updates.failurePrompt) || undefined;
-	if (updates.wakeOn !== undefined) task.wakeOn = normalizeWakeOn(updates.wakeOn, true);
+	if (updates.wakeOn !== undefined) {
+		const wakeOn = normalizeWakeOn(updates.wakeOn, true);
+		if (wakeOn === "change" && task.wakeOn !== "change") {
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.wakeOn = wakeOn;
+	}
 	if (updates.stopOn !== undefined) {
 		task.stopOn = normalizeStopOn(updates.stopOn);
 		delete task.stopReason;
@@ -620,10 +785,19 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.action !== undefined && task.action !== "shell") delete task.stopOn;
 	if (updates.prompt !== undefined) task.prompt = compactSpaces(updates.prompt);
 	if (updates.message !== undefined) task.message = compactSpaces(updates.message);
-	if (updates.command !== undefined) task.command = compactSpaces(updates.command);
+	if (updates.command !== undefined) {
+		const command = compactSpaces(updates.command);
+		if (command !== task.command) {
+			task.executionRevision = randomUUID();
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.command = command;
+	}
 	if (updates.triggerTurn !== undefined) task.triggerTurn = Boolean(updates.triggerTurn);
 
-	if (updates.schedule !== undefined || updates.when !== undefined || updates.whenText !== undefined || updates.type !== undefined) {
+	if (scheduleChanged || updates.backoff !== undefined) {
 		const schedule = compactSpaces(updates.schedule ?? updates.whenText ?? updates.when ?? task.schedule ?? task.whenText ?? "");
 		const validated = validateTaskSchedule(task.type ?? "once", schedule, nowValue);
 		task.type = validated.type;
@@ -647,26 +821,38 @@ function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date(), opti
 	const now = asDate(nowValue);
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
-	if (task.enabled === false || isTerminal(task)) return task;
+	if (task.enabled === false || isTerminal(task) || !canClaimTask(task, now)) return task;
 	task.status = "running";
 	task.lastStatus = "running";
 	task.startedAt = now.toISOString();
 	if (options.runOwner) task.runOwner = { ...options.runOwner, startedAt: now.toISOString() };
+	task.runAttemptId = options.runOwner?.attemptId ?? randomUUID();
 	return task;
 }
 
 function finishTaskAfterRun(task, now, ok, result) {
 	const remainDisabled = task.enabled === false;
+	appendRunHistory(task, now, result, result?.interrupted ? "interrupted" : (ok ? "success" : "error"));
+	delete task.interruptedRun;
+	delete task.startedAt;
+	delete task.runAttemptId;
 	delete task.runOwner;
 	task.runCount = (Number.isInteger(task.runCount) ? task.runCount : 0) + 1;
 	task.lastRun = now.toISOString();
 	task.lastStatus = ok ? "success" : "error";
 	if (ok) delete task.lastError;
 	if (result !== undefined) task.result = result;
+	if (task.expiresAt && Date.parse(task.expiresAt) <= now.getTime()) {
+		task.enabled = false;
+		task.status = "expired";
+		task.expiredAt = now.toISOString();
+		task.nextRun = undefined;
+		return task;
+	}
 
 	const reachedMaxRuns = task.maxRuns !== undefined && task.runCount >= task.maxRuns;
 	const stopOn = task.action === "shell" ? normalizeStopOn(task.stopOn) : "never";
-	const stoppedOnResult = stopOn !== "never" && ((stopOn === "success" && ok) || (stopOn === "failure" && !ok));
+	const stoppedOnResult = result?.superseded !== true && stopOn !== "never" && ((stopOn === "success" && ok) || (stopOn === "failure" && !ok));
 	if (task.type === "once" || reachedMaxRuns || (!remainDisabled && stoppedOnResult)) {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
@@ -691,6 +877,13 @@ function finishTaskAfterRun(task, now, ok, result) {
 		task.nextRun = validated.nextRun;
 		task.dueAt = validated.dueAt;
 		if (validated.intervalMs !== undefined) task.intervalMs = validated.intervalMs;
+		if (task.backoff) {
+			const nextInterval = Math.min(task.backoff.maxIntervalMs, Math.round(task.backoff.currentIntervalMs * task.backoff.factor));
+			if (!Number.isSafeInteger(nextInterval)) throw new Error("backoff interval exceeds safe timer range");
+			task.backoff.currentIntervalMs = nextInterval;
+			task.nextRun = new Date(now.getTime() + nextInterval).toISOString();
+			task.dueAt = task.nextRun;
+		}
 	} catch {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
@@ -704,30 +897,37 @@ function markScheduledTaskCompleted(tasks, idOrPrefix, nowValue = new Date(), re
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled") {
+		appendRunHistory(task, now, result, "cancelled");
 		delete task.runOwner;
 		delete task.startedAt;
+		delete task.runAttemptId;
 		return task;
 	}
+	const historyResult = result && typeof result === "object" ? { ...result } : result;
+	if (historyResult && options.wakeReason !== undefined) historyResult.wakeReason = options.wakeReason;
+	if (historyResult && options.wakeDisposition !== undefined) historyResult.wakeDisposition = options.wakeDisposition;
 	const ok = options.ok === undefined
 		? (task.action === "shell" ? shellResultOk(result) : true)
 		: options.ok !== false;
-	return finishTaskAfterRun(task, now, ok, result);
+	return finishTaskAfterRun(task, now, ok, historyResult);
 }
 
 function markScheduledTaskFired(tasks, idOrPrefix, nowValue = new Date(), result) {
 	return markScheduledTaskCompleted(tasks, idOrPrefix, nowValue, result, { ok: true });
 }
 
-function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error) {
+function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error, options = {}) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled") {
+		appendRunHistory(task, asDate(nowValue), {error: error instanceof Error ? error.message : String(error), wakeReason: "execution-error", wakeDisposition: "not-requested"}, "cancelled");
 		delete task.runOwner;
 		delete task.startedAt;
+		delete task.runAttemptId;
 		return task;
 	}
 	task.lastError = error instanceof Error ? error.message : String(error);
-	return finishTaskAfterRun(task, asDate(nowValue), false, undefined);
+	return finishTaskAfterRun(task, asDate(nowValue), false, { error: task.lastError, superseded: options.superseded === true, interrupted: task.interruptedRun, wakeReason: task.interruptedRun ? "interrupted" : "execution-error", wakeDisposition: "not-requested" });
 }
 
 function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
@@ -743,10 +943,13 @@ function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
 			task.lastStatus = "error";
 			task.lastError = error.message;
 			task.nextRun = undefined;
+			appendRunHistory(task, now, {error: error.message, wakeReason: "interrupted", wakeDisposition: "not-requested"}, "interrupted");
 			delete task.runOwner;
 			delete task.startedAt;
+			delete task.runAttemptId;
 			continue;
 		}
+		task.interruptedRun = true;
 		markScheduledTaskFailed(tasks, task.id, now, error);
 	}
 	return interrupted;
@@ -756,6 +959,20 @@ function shellResultOk(result) {
 	if (typeof result?.ok === "boolean") return result.ok;
 	if (typeof result?.code === "number") return result.code === 0 && result.killed !== true;
 	return true;
+}
+
+// Hash the complete command result before any UI/state output truncation. JSON
+// framing keeps stdout/stderr and status values unambiguous.
+function shellResultFingerprint(result) {
+	if (typeof result?.wakeOnChangeFingerprint === "string") return result.wakeOnChangeFingerprint;
+	return createHash("sha256")
+		.update(JSON.stringify([
+			String(result?.stdout ?? ""),
+			String(result?.stderr ?? ""),
+			result?.code ?? null,
+			Boolean(result?.killed),
+		]))
+		.digest("hex");
 }
 
 function hasShellFollowUpPrompt(task) {
@@ -770,6 +987,13 @@ function shouldWakeForShellResult(task, result) {
 	if (wakeOn === "always") return true;
 	if (wakeOn === "success") return ok;
 	if (wakeOn === "failure") return !ok;
+	if (wakeOn === "change") {
+		const fingerprint = shellResultFingerprint(result);
+		const key = `${task.command ?? ""}\0${task.cwd ?? result.cwd ?? ""}`;
+		const changed = task.wakeOnChangeKey === key && task.lastResultFingerprint !== undefined
+			&& task.lastResultFingerprint !== fingerprint;
+		return changed;
+	}
 	return false;
 }
 
@@ -834,14 +1058,22 @@ function formatTaskLine(task, nowValue = new Date()) {
 	const next = task.nextRun ? `${formatRelativeTime(task.nextRun, nowValue)} (${new Date(task.nextRun).toLocaleString()})` : "no next run";
 	const enabled = task.enabled === false ? "disabled" : "enabled";
 	const last = task.lastStatus ? ` last=${task.lastStatus}` : "";
-	return `- ${task.id} ${label} next=${next} [${task.action}/${task.type}] ${enabled} status=${task.status} runs=${task.runCount ?? 0}${last} schedule=${formatSchedule(task)} :: ${taskSummary(task)}`;
+	const expiry = task.expiresAt ? ` expiresAt=${task.expiresAt}` : "";
+	return `- ${task.id} ${label} next=${next} [${task.action}/${task.type}] ${enabled} status=${task.status} runs=${task.runCount ?? 0}${last}${expiry} schedule=${formatSchedule(task)} :: ${taskSummary(task)}`;
 }
 
 function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 	const list = options.includeAll ? tasks.slice().sort(sortByNextRun) : pendingTasks(tasks);
 	if (list.length === 0) return options.includeAll ? "No scheduled tasks." : "No active scheduled tasks.";
 	const title = options.includeAll ? "Scheduled tasks:" : "Active scheduled tasks:";
-	return [title, ...list.map((task) => formatTaskLine(task, nowValue))].join("\n");
+	const lines = [title];
+	for (const task of list) {
+		lines.push(formatTaskLine(task, nowValue));
+		if (options.includeHistory && task.history?.length) {
+			for (const run of task.history) lines.push(`  · ${run.attemptId} ${run.outcome?.status ?? "unknown"} ${run.completedAt} (${run.durationMs}ms)${run.wakeDisposition ? ` wake=${run.wakeDisposition}` : ""}`);
+		}
+	}
+	return lines.join("\n");
 }
 
 module.exports = {
@@ -863,6 +1095,7 @@ module.exports = {
 	normalizeType,
 	normalizeScope,
 	normalizeWakeOn,
+	normalizeBackoff,
 	normalizeStopOn,
 	generateId,
 	createScheduledTask,
@@ -870,10 +1103,13 @@ module.exports = {
 	sanitizeTasks,
 	taskMatchesScope,
 	pendingTasks,
+	canClaimTask,
+	expireOverdueTasks,
 	dueTasks,
 	parseCatchUpOptions,
 	selectCatchUpCronTasks,
 	recoverInterruptedTasks,
+	shellResultFingerprint,
 	cancelScheduledTask,
 	disableScheduledTask,
 	enableScheduledTask,
