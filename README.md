@@ -1,139 +1,92 @@
 # Pi Scheduler
 
-**Scheduled actions for Pi agents: reminders, self-waking prompts, recurring shell commands, and command-output follow-ups.**
+**Run checks on a schedule. Wake the agent when there’s something to do.**
 
-Pi Scheduler is a [Pi](https://github.com/earendil-works/pi) extension that lets an agent schedule future work from inside the conversation. It focuses on **scheduled actions**, not just prompts: the agent can wake itself later, run shell commands directly, capture stdout/stderr, and decide what to do next.
+Schedule shell commands, agent prompts, and reminders inside [Pi](https://github.com/earendil-works/pi). Commands run directly and bring their output back to the agent when your wake policy matches.
 
-## Why?
+> “Run the tests every five minutes. Wake yourself if they fail. Stop after ten runs.”
 
-Coding agents often need to wait:
+## Why this package?
 
-- A GitLab/GitHub pipeline is still running.
-- A deployment needs a few minutes to roll out.
-- A long build or test command should be checked later.
-- You want a reminder or a recurring project check.
+Pi Scheduler focuses on **scheduled actions**: run a command, capture stdout/stderr, and trigger a follow-up on success or failure. Execution limits, persistent tasks, and atomic claims let multiple Pi processes share scheduled work.
 
-Without scheduling, the agent has to stop and hope you come back. With Pi Scheduler, it can schedule follow-up work such as:
+Prompt loops suit checks that need agent judgment every time. Broader packages such as [pi-loop](https://github.com/trvon/pi-loop) also provide workflows, event triggers, orchestration, and command monitoring. Choose Pi Scheduler when you want a focused scheduler for commands, prompts, and reminders.
 
-> “Run `glab pipeline view` every 5 minutes, wake me only on failure, and stop after 10 checks.”
+**Pi must be running for tasks to fire.** Tasks persist across restarts, but this package does not run an always-on daemon.
 
-## Features
-
-- **Self-waking prompts** — schedule a future prompt that wakes the agent in the current Pi session.
-- **Direct shell scheduling** — run commands later or repeatedly without first asking the model to call `bash`.
-- **Command-output follow-ups** — feed stdout/stderr back to the agent with success/failure-specific instructions.
-- **Recurring schedules** — `once`, `interval`, and `cron` schedules for all action types.
-- **Bounded polling** — `maxRuns` disables recurring tasks after a fixed number of executions.
-- **Task lifecycle management** — enable, disable, update, remove, cleanup, list.
-- **Scopes** — bind tasks to a session, cwd/project, or all sessions.
-- **Compact widget** — shows the next few scheduled actions below the editor.
-- **Persistent state** — scheduled tasks are stored in `~/.pi/agent/state/scheduler/tasks.json`.
-- **Multi-process coordination** — atomic state transactions and task claims allow multiple Pi agents to share a cwd safely.
-
-## Install
-
-Install from npm:
+## Get started
 
 ```bash
 pi install npm:@jl1990/pi-scheduler
 ```
 
-Or install directly from GitHub:
-
-```bash
-pi install git:git@github.com:jl1990/pi-scheduler.git
-```
-
-Then restart Pi, or run:
+Restart Pi or run `/reload`. Ask for a scheduled task in plain language, or try:
 
 ```text
-/reload
+/remind 20m take a break
+/schedule prompt 5m :: Check whether the deployment has finished.
+/schedules
 ```
 
-## Agent tools
+A compact widget shows upcoming tasks below the editor.
 
-Pi Scheduler registers these tools for the agent:
+## Example: run tests, investigate failures
 
-- `schedule_task` — schedule a future or recurring action.
-- `list_scheduled_tasks` — list active or historical tasks.
-- `cancel_scheduled_task` — cancel a task by ID or prefix.
-- `manage_scheduled_task` — enable, disable, remove, update, or cleanup tasks.
-
-### Scheduled action types
-
-| Action | What it does | Best for |
-| --- | --- | --- |
-| `shell` | Runs a shell command and stores stdout/stderr | CI polling, tests, status commands |
-| `prompt` | Injects a user prompt and wakes the agent | Agentic follow-ups |
-| `notify` | Shows a reminder/notification | Human reminders |
-| `message` | Injects a scheduled custom message | Lightweight status/context messages |
-
-### Schedule types
-
-| Type | Example | Meaning |
-| --- | --- | --- |
-| `once` | `5m`, `tomorrow at 9am`, ISO datetime | Run one time |
-| `interval` | `5m`, `1h`, `30s` | Run repeatedly after each interval |
-| `cron` | `0 */5 * * * *` | Run on a cron schedule via `croner` |
-
-Cron expressions use `croner`; 6-field expressions with seconds are recommended:
-
-```text
-0 */5 * * * *   every 5 minutes
-0 0 * * * *     hourly
-0 0 9 * * 1-5   weekdays at 9am
-```
-
-## Example: bounded GitLab pipeline polling
-
-Schedule a direct command every 5 minutes, wake the agent only if it fails, and stop after 10 checks:
+Ask Pi to schedule this, or use these arguments with its `schedule_task` tool:
 
 ```json
 {
   "action": "shell",
   "type": "interval",
   "schedule": "5m",
-  "name": "pipeline-123",
-  "command": "glab pipeline view 123 --repo jl1990/example",
+  "command": "npm test",
+  "timeoutMs": 120000,
   "wakeOn": "failure",
-  "failurePrompt": "The scheduled pipeline check failed or returned a non-zero status. Inspect the pipeline/jobs/logs and propose or apply fixes.",
+  "failurePrompt": "Review the test output, diagnose the failure, and report the cause.",
   "maxRuns": 10,
   "scope": "cwd"
 }
 ```
 
-## Example: recurring agent prompt
+Use a test command that finishes rather than entering watch mode. Every five minutes, the scheduler runs it and captures the result:
 
-```json
-{
-  "action": "prompt",
-  "type": "interval",
-  "schedule": "10m",
-  "prompt": "Check whether the deployment has finished. If it failed, inspect logs. If it is still running, continue monitoring.",
-  "maxRuns": 6
-}
-```
+- **Pass:** no agent turn. Pi may still show execution notifications and result messages.
+- **Non-zero exit or timeout:** wake the agent with stdout/stderr to investigate.
+- **Ten executions:** disable the task automatically.
 
-## Example: one-shot command with output review
+Recurring tasks do not stop when an external goal completes. Cancel them when finished, or bound them with `maxRuns`.
 
-```json
-{
-  "action": "shell",
-  "type": "once",
-  "schedule": "2m",
-  "command": "npm test",
-  "wakeOn": "always",
-  "followUpPrompt": "Review this test output. If tests failed, fix the issue. If they passed, summarize the result."
-}
-```
+## Scheduling options
 
-## Slash commands
+| Option | Choices |
+| --- | --- |
+| Action | `shell` runs a command; `prompt` wakes the agent; `notify` shows a reminder; `message` adds a custom message |
+| Schedule | `once`: `5m`, `tomorrow at 9am`, ISO datetime; `interval`: `30s`, `5m`, `1h`; `cron`: `0 0 9 * * 1-5` (weekdays at 9am) |
+| Scope | `session` (default): creating session; `cwd`: sessions in the same project directory; `global`: any session |
+| Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command |
+
+Cron uses `croner`; six-field expressions with seconds are recommended. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
+
+### Shell wake policy
+
+| `wakeOn` | Wake the agent when… |
+| --- | --- |
+| `failure` | The command exits non-zero or is killed/times out |
+| `success` | The command exits 0 without being killed |
+| `always` | Any run finishes |
+| `never` | Never; just record the result |
+
+Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `followUpPrompt` for either outcome. The wake policy is checked first. Without an explicit policy, supplying a prompt defaults to `always`; otherwise the default is `never`. An explicit matching policy without a custom prompt uses a default review instruction.
+
+**Exit status matters.** A command that prints a failed CI pipeline may still exit 0. For CI polling, use a command or wrapper that maps pipeline states to the intended exit status; pending is not automatically a separate state.
+
+## Manage tasks
+
+Ask Pi to list, update, disable, or remove tasks. Its tools are `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task`, and `manage_scheduled_task`.
 
 ```text
-/schedule [notify|prompt|shell|message] [once|interval|cron|every] <schedule> :: <payload>
-/remind <when> <message>
-/schedules
-/schedules all
+/schedules                       # active tasks
+/schedules all                   # include history
 /schedule-cancel <id-or-prefix>
 /schedule-enable <id-or-prefix>
 /schedule-disable <id-or-prefix>
@@ -142,151 +95,33 @@ Schedule a direct command every 5 minutes, wake the agent only if it fails, and 
 /schedule-widget [on|off]
 ```
 
-Examples:
+To create tasks directly:
 
 ```text
-/remind 5m stretch
-/schedule prompt 3m :: Check the GitLab pipeline and schedule another check if still running.
-/schedule shell every 5m :: glab pipeline view 123 --repo jl1990/example
-/schedule shell cron 0 */5 * * * * :: date
-/schedules
-/schedules all
-/schedule-disable task_abc123
-/schedule-cleanup
+/schedule [notify|prompt|shell|message] [once|interval|cron|every] <schedule> :: <payload>
 ```
 
-## Time formats
+## Persistence and recovery
 
-One-shot schedules support examples like:
+Tasks live in `~/.pi/agent/state/scheduler/tasks.json`. Atomic state transactions and task claims coordinate execution across Pi processes; shared state refreshes every five seconds.
 
-```text
-5m
-+5m
-in 10 minutes
-1h30m
-2 days
-tomorrow at 9am
-14:30
-2026-07-06T10:00:00
-```
+On restart, overdue one-shot and interval tasks run. Cron catches up the most recent missed occurrence per task, newest first, within these limits:
 
-Interval schedules use durations like:
-
-```text
-30s
-5m
-1h
-2d
-```
-
-## Scopes
-
-`scope` controls where a task is visible and allowed to fire:
-
-| Scope | Behavior |
+| Environment variable | Default |
 | --- | --- |
-| `session` | Default. Bound to the Pi session that created it. |
-| `cwd` | Visible to Pi sessions in the same working directory. Good for project automation. |
-| `global` | Visible from any Pi session. |
+| `PI_SCHEDULER_CATCHUP_WINDOW_H` | `24` hours |
+| `PI_SCHEDULER_CATCHUP_MAX` | `5` tasks per startup; `0` disables cron catch-up |
 
-## Wake behavior for shell tasks
-
-Shell tasks can control when the parent agent is woken:
-
-| `wakeOn` | Behavior |
-| --- | --- |
-| `always` | Wake after every run if a prompt is configured. |
-| `failure` | Wake only when the command exits non-zero or is killed/timed out. |
-| `success` | Wake only on exit code 0. |
-| `never` | Never wake the agent; just record the result. |
-
-Prompt priority:
-
-1. `successPrompt` on success
-2. `failurePrompt` on failure
-3. `followUpPrompt` fallback
-
-## Design focus
-
-Pi Scheduler focuses on **scheduled actions**:
-
-- direct scheduled shell commands
-- deterministic stdout/stderr capture
-- success/failure-specific agent wakeups
-- bounded command polling with `maxRuns`
-- prompt/notify/message actions as lightweight companions
-
-The goal is to make command-driven automation simple: schedule the check, capture the result, and wake the agent only when useful.
-
-## Important limitations
-
-Pi Scheduler currently uses **in-process timers**:
-
-- If Pi is running, tasks fire at the scheduled time.
-- If Pi is closed, tasks do not fire while Pi is closed.
-- Overdue one-shot and interval tasks fire when the relevant Pi session starts again.
-- For each overdue cron task, Pi Scheduler catches up its most recent missed occurrence when that occurrence is inside the configured catch-up window. Catch-up is newest-first and bounded per startup.
-
-Cron catch-up can be configured with environment variables:
-
-| Variable | Default | Description |
-| --- | ---: | --- |
-| `PI_SCHEDULER_CATCHUP_WINDOW_H` | `24` | Maximum age, in hours, of the most recent missed cron occurrence. |
-| `PI_SCHEDULER_CATCHUP_MAX` | `5` | Maximum number of missed cron tasks fired per session start. Set to `0` to disable cron catch-up. |
-
-Invalid, negative, or non-finite values fall back to the defaults; `PI_SCHEDULER_CATCHUP_MAX` must also be a whole number. If Pi stopped while a task was already running, the interrupted attempt is recorded as failed rather than retried blindly: one-shot tasks remain failed, while recurring tasks are rescheduled from startup time.
-
-Task state is coordinated across Pi processes with an atomic filesystem lock. Multiple agents may share the same cwd: all relevant processes can observe `cwd` tasks, while an atomic claim ensures only one process executes each due occurrence. The process that wins the claim receives prompt/message follow-ups. Use `session` scope when a follow-up must return to one specific Pi session.
-
-Running processes refresh shared scheduler state every five seconds so they can discover tasks created by another agent. `global` tasks use the same single-claim behavior across all running Pi processes.
-
-This is enough for live agent workflows like CI polling while a Pi session is open. A future version could add OS-level `cron`, `at`, launchd, systemd, or a small daemon for exact wakeups while Pi is not running.
+Interrupted executions are recorded as failed: one-shot tasks remain failed, while recurring tasks are rescheduled. Shell commands run with your local user permissions.
 
 ## Development
 
-Run tests:
-
 ```bash
 npm test
-```
-
-Check what will be published to npm:
-
-```bash
 npm pack --dry-run
-```
-
-Load-check the extension locally:
-
-```bash
 PI_OFFLINE=1 pi --no-extensions -e ./extensions/scheduler/index.ts --list-models __unlikely_model_filter__
 ```
 
-Try a command without starting a model turn:
+Published GitHub Releases trigger the [npm publishing workflow](.github/workflows/publish-npm.yml), which tests, checks package contents, and publishes with provenance.
 
-```bash
-PI_OFFLINE=1 pi --no-extensions -e ./extensions/scheduler/index.ts --no-session --mode json -p "/schedules"
-```
-
-## Publishing
-
-This package is published as:
-
-```text
-@jl1990/pi-scheduler
-```
-
-The GitHub Actions workflow `.github/workflows/publish-npm.yml` publishes to npm when a GitHub Release is published.
-
-Release flow:
-
-```bash
-npm version patch   # or minor/major
-git push --follow-tags
-```
-
-Then create/publish a GitHub Release for the new tag. The workflow will run tests, check package contents, and publish with npm provenance.
-
-## Security notes
-
-This extension can run scheduled shell commands with your local user permissions. Only install Pi packages from sources you trust, and review scheduled shell tasks before using them in sensitive environments.
+[MIT license](LICENSE.md)
