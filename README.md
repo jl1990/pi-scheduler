@@ -54,7 +54,11 @@ Use a test command that finishes rather than entering watch mode. Every five min
 - **Non-zero exit or timeout:** wake the agent with stdout/stderr to investigate.
 - **Ten executions:** disable the task automatically.
 
-Recurring tasks do not stop when an external goal completes. Cancel them when finished, or bound them with `maxRuns`.
+For recurring shell tasks, `stopOn` may be `success`, `failure`, or `never` (the default). It disables recurrence after the matching result; non-zero exits, timeouts, and killed commands count as failures. `stopOn` is independent of `wakeOn`.
+
+Recurring tasks do not stop when an external goal completes unless configured with `stopOn`. Cancel them when finished, or bound them with `maxRuns`.
+
+Use `expiresIn: "2h"` to stop starting new runs after two hours. The absolute deadline persists across restarts. Expiry is silent and visible as `expired` in task history; an already-running command finishes with its usual wake policy. Renew an expired task with a new `expiresIn`, or set it to `null` in `manage_scheduled_task` to clear the deadline and resume it.
 
 ## Scheduling options
 
@@ -63,7 +67,8 @@ Recurring tasks do not stop when an external goal completes. Cancel them when fi
 | Action | `shell` runs a command; `prompt` wakes the agent; `notify` shows a reminder; `message` adds a custom message |
 | Schedule | `once`: `5m`, `tomorrow at 9am`, ISO datetime; `interval`: `30s`, `5m`, `1h`; `cron`: `0 0 9 * * 1-5` (weekdays at 9am) |
 | Scope | `session` (default): creating session; `cwd`: sessions in the same project directory; `global`: any session |
-| Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command |
+| Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command; `expiresIn` sets a positive lifetime (for example `2h`) |
+| `stopOn` | For shell actions, stop recurrence after `success`, `failure`, or `never` (default) |
 | `backoff` | Interval-only `{ "factor": 2, "maxInterval": "15m" }` grows the delay after each execution, up to the cap |
 
 Backoff applies to every outcome and persists across restarts. Updating the schedule or backoff, or explicitly enabling a task, resets the delay to the base interval. Set `backoff: null` to return to a fixed interval; remove it explicitly when switching to cron or once. Execution limits still count runs normally.
