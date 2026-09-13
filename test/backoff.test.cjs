@@ -77,6 +77,21 @@ test("explicit enable resets progression and disabled or cancelled in-flight run
 	assert.equal(cancelledTasks[0].nextRun, undefined);
 });
 
+test("explicit enabled:true update resets progressed backoff with its newly scheduled base nextRun", () => {
+	const task = core.createScheduledTask({ action: "notify", type: "interval", schedule: "5m", message: "poll", backoff: { factor: 2, maxInterval: "15m" } }, NOW, () => "update-enabled");
+	task.backoff.currentIntervalMs = min(10);
+	task.enabled = false;
+	task.nextRun = undefined;
+	core.updateScheduledTask([task], task.id, { enabled: true }, NOW);
+	assert.equal(task.enabled, true);
+	assert.equal(task.backoff.currentIntervalMs, min(5));
+	assert.equal(Date.parse(task.nextRun), NOW.getTime() + min(5));
+	task.backoff.currentIntervalMs = min(10);
+	core.updateScheduledTask([task], task.id, { enabled: true }, NOW);
+	assert.equal(task.backoff.currentIntervalMs, min(5), "explicit enable also resets an already enabled task");
+	assert.equal(Date.parse(task.nextRun), NOW.getTime() + min(5));
+});
+
 test('schedule and backoff update validate against the new base and reset next delay', () => {
 	const make = () => core.createScheduledTask({action:'shell',type:'interval',schedule:'5m',command:'check',backoff:{factor:2,maxInterval:'15m'}},NOW,()=> 'update');
 	const increasing = make();

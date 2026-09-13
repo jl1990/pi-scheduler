@@ -354,19 +354,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			const message = task.message ?? "Scheduled reminder";
 			if (ctx.hasUI) ctx.ui.notify(message, "info");
 			recordMessage(`🔔 ${message}`, { task }, false);
-			return { ok: true, delivered: "notify" };
+			return { ok: true, delivered: "notify", wakeReason: "notify", wakeDisposition: "not-requested" };
 		}
 
 		if (task.action === "prompt") {
 			const prompt = `${scheduledPromptHeader(task)}${task.prompt}`;
 			sendAgentPrompt(pi, ctx, prompt);
-			return { ok: true, delivered: "prompt" };
+			return { ok: true, delivered: "prompt", wakeReason: "prompt", wakeDisposition: "delivered" };
 		}
 
 		if (task.action === "message") {
 			const message = task.message ?? "Scheduled message";
 			recordMessage(`⏰ ${message}`, { task }, task.triggerTurn !== false);
-			return { ok: true, delivered: "message", triggerTurn: task.triggerTurn !== false };
+			return { ok: true, delivered: "message", triggerTurn: task.triggerTurn !== false, wakeReason: "message", wakeDisposition: task.triggerTurn !== false ? "delivered" : "not-requested" };
 		}
 
 		if (task.action === "shell") {
@@ -381,7 +381,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				code: result.code,
 				killed: result.killed,
 			});
-			const shellResult = {
+			const shellResult: Record<string, any> = {
 				ok: result.code === 0 && result.killed !== true,
 				command: task.command,
 				cwd,
@@ -393,7 +393,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				stderr: truncateMiddle(result.stderr ?? "", MAX_STORED_OUTPUT_CHARS),
 			};
 
-			if (!isActive()) return { ...shellResult, outputSuppressed: true };
+			if (!isActive()) return { ...shellResult, outputSuppressed: true, wakeReason: task.wakeOn ?? "never", wakeDisposition: "session-suppressed" };
 
 			recordMessage(
 				`🖥️ Scheduled command ${task.id} finished with exit code ${result.code}: ${task.command}`,
@@ -401,10 +401,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				false,
 			);
 
-			if (task.wakeOn !== "change" && core.shouldWakeForShellResult(task, shellResult)) {
-				const instruction = core.selectShellFollowUpPrompt(task, shellResult);
-				if (instruction) sendAgentPrompt(pi, ctx, shellResultPrompt(task, shellResult, instruction));
-			}
+			shellResult.wakeReason = task.wakeOn ?? "never";
+			shellResult.wakeDisposition = "suppressed";
 
 			return shellResult;
 		}
@@ -465,37 +463,72 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
-			let wakeOnChange = false;
+			result.attemptId = attemptId;
+			let wakeRequested = false;
 			let wakeTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
-				// A command/cwd or wake-policy edit while the process was running owns
-				// the new state; never let this stale result restore its baseline.
-				if (task?.wakeOn === "change" && result.wakeOnChangeFingerprint
-					&& persisted.enabled !== false && persisted.status === "running"
-					&& persisted.action === "shell"
-					&& persisted.wakeOn === "change"
-					&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision
-					&& persisted.command === task.command
-					&& (persisted.cwd ?? ctx.cwd) === (task.cwd ?? ctx.cwd)) {
-					wakeOnChange = core.shouldWakeForShellResult(persisted, result);
-					persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
-					persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
-					if (wakeOnChange) wakeTask = { ...persisted };
+				// The current configuration wins over the snapshot that launched the
+				// command, including A -> B -> A edits while it was running.
+				result.superseded = persisted.executionRevision !== task?.executionRevision
+					|| persisted.action !== task?.action || persisted.command !== task?.command
+					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+				if (task?.action === "shell" && !result.superseded
+					&& persisted.enabled !== false && persisted.status === "running") {
+					result.wakeReason = persisted.wakeOn ?? "never";
+					if (persisted.wakeOn !== "change") {
+						wakeRequested = core.shouldWakeForShellResult(persisted, result);
+					} else if (task.wakeOn === "change" && result.wakeOnChangeFingerprint
+						&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision) {
+						wakeRequested = core.shouldWakeForShellResult(persisted, result);
+						persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
+						persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
+					}
+					if (wakeRequested) {
+						result.wakeDisposition = "pending";
+						wakeTask = { ...persisted };
+					}
 				}
 				core.markScheduledTaskCompleted(current, persisted.id, new Date(), result, { ok: result.ok !== false });
 			});
-			if (wakeOnChange && wakeTask && isSessionActive(ctx, generation)) {
-				const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
-				if (instruction) sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+			if (wakeRequested && wakeTask) {
+				result.wakeDisposition = "session-suppressed";
+				if (isSessionActive(ctx, generation)) {
+					const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
+					result.wakeDisposition = "no-followup";
+					if (instruction) {
+						try {
+							sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+							result.wakeDisposition = "delivered";
+						} catch (error: any) {
+							result.wakeDisposition = "failed";
+							result.wakeError = String(error?.message ?? error).slice(0, 1000);
+						}
+					}
+				}
+				await transactTasks((current) => {
+					const persisted = current.find((candidate) => candidate.id === taskId);
+					const historyEntry = persisted?.history?.find((entry: any) => entry.attemptId === attemptId);
+					if (historyEntry) {
+						historyEntry.wakeDisposition = result.wakeDisposition;
+						if (result.wakeError) historyEntry.wakeError = result.wakeError;
+					}
+					if (persisted?.result?.attemptId === attemptId) {
+						persisted.result.wakeDisposition = result.wakeDisposition;
+						if (result.wakeError) persisted.result.wakeError = result.wakeError;
+					}
+				});
 			}
 		} catch (error: any) {
 			let failedTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
-				core.markScheduledTaskFailed(current, persisted.id, new Date(), error);
+				const superseded = persisted.executionRevision !== task?.executionRevision
+					|| persisted.action !== task?.action || persisted.command !== task?.command
+					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+				core.markScheduledTaskFailed(current, persisted.id, new Date(), error, { superseded });
 				failedTask = { ...persisted };
 			});
 			if (failedTask && isSessionActive(ctx, generation)) {
@@ -653,12 +686,14 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("schedules", {
-		description: "List scheduled tasks; pass 'all' to include disabled/completed/cancelled/failed tasks",
+		description: "List scheduled tasks; pass 'all' to include inactive tasks or 'history' for run history",
 		handler: async (args, ctx) => {
 			await loadTasks();
-			const includeAll = args.trim().toLowerCase() === "all";
+			const view = args.trim().toLowerCase();
+			const includeAll = view === "all" || view === "history";
+			const includeHistory = view === "history";
 			const visible = visibleTasks(ctx);
-			recordMessage(core.formatTaskList(visible, new Date(), { includeAll }), { includeAll, tasks: visible }, false);
+			recordMessage(core.formatTaskList(visible, new Date(), { includeAll, includeHistory }), { includeAll, includeHistory, tasks: visible }, false);
 			updateStatus(ctx);
 		},
 	});
@@ -836,11 +871,18 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		promptSnippet: "List pending/all scheduled future or recurring actions visible to the current Pi session",
 		parameters: Type.Object({
 			includeAll: Type.Optional(Type.Boolean({ description: "Include disabled, fired, cancelled, and failed tasks. Default false." })),
+			includeHistory: Type.Optional(Type.Boolean({ description: "Include compact per-run history. Default false." })),
+			id: Type.Optional(Type.String({ description: "Show history for one task id or prefix." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			await loadTasks();
-			const visible = visibleTasks(ctx);
-			const text = core.formatTaskList(visible, new Date(), { includeAll: Boolean(params.includeAll) });
+			let visible = visibleTasks(ctx);
+			if (params.id) {
+				const matches = visible.filter((task) => task.id === params.id || task.id.startsWith(params.id));
+				if (matches.length !== 1) throw new Error(`Scheduled task not found or prefix is ambiguous: ${params.id}`);
+				visible = matches;
+			}
+			const text = core.formatTaskList(visible, new Date(), { includeAll: Boolean(params.includeAll || params.id || params.includeHistory), includeHistory: Boolean(params.includeHistory) });
 			updateStatus(ctx);
 			return { content: [{ type: "text", text }], details: { tasks: visible } };
 		},

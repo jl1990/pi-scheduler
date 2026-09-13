@@ -87,7 +87,7 @@ Cron uses `croner`; six-field expressions with seconds are recommended. Use `ses
 
 Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `followUpPrompt` for either outcome. The wake policy is checked first. Without an explicit policy, supplying a prompt defaults to `always`; otherwise the default is `never`. An explicit matching policy without a custom prompt uses a default review instruction.
 
-`change` stores a SHA-256 fingerprint of the complete (untruncated) shell result in task state. The first run establishes the baseline without waking; repeated identical results stay quiet. Editing the command, working directory, or opting into `change` starts a new baseline.
+`change` stores a SHA-256 fingerprint of the complete (untruncated) shell result in task state. The first run establishes the baseline without waking; repeated identical results stay quiet. Editing the command, working directory, or opting into `change` starts a new baseline. If that first run matches `stopOn`, the task stops silently; use `success` or `failure` when the stopping result must wake the agent.
 
 **Exit status matters.** A command that prints a failed CI pipeline may still exit 0. For CI polling, use a command or wrapper that maps pipeline states to the intended exit status; pending is not automatically a separate state.
 
@@ -95,9 +95,12 @@ Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `fo
 
 Ask Pi to list, update, disable, or remove tasks. Its tools are `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task`, and `manage_scheduled_task`.
 
+Completed runs keep a compact history of the latest 10 attempts (timestamps, duration, outcome, and wake disposition). Use `list_scheduled_tasks` with `includeHistory: true` (and optionally `id`) to inspect it; the default listing remains compact. `delivered` means a wake was submitted to Pi, not that an agent turn finished; `pending` means delivery was not yet recorded.
+
 ```text
 /schedules                       # active tasks
-/schedules all                   # include history
+/schedules all                   # include inactive tasks
+/schedules history               # show compact run history
 /schedule-cancel <id-or-prefix>
 /schedule-enable <id-or-prefix>
 /schedule-disable <id-or-prefix>
