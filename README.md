@@ -64,6 +64,9 @@ Recurring tasks do not stop when an external goal completes. Cancel them when fi
 | Schedule | `once`: `5m`, `tomorrow at 9am`, ISO datetime; `interval`: `30s`, `5m`, `1h`; `cron`: `0 0 9 * * 1-5` (weekdays at 9am) |
 | Scope | `session` (default): creating session; `cwd`: sessions in the same project directory; `global`: any session |
 | Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command |
+| `backoff` | Interval-only `{ "factor": 2, "maxInterval": "15m" }` grows the delay after each execution, up to the cap |
+
+Backoff applies to every outcome and persists across restarts. Updating the schedule or backoff, or explicitly enabling a task, resets the delay to the base interval. Set `backoff: null` to return to a fixed interval; remove it explicitly when switching to cron or once. Execution limits still count runs normally.
 
 Cron uses `croner`; six-field expressions with seconds are recommended. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
 
