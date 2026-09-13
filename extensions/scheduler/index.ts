@@ -16,7 +16,8 @@ const { createTaskStore } = require("./task-store.cjs");
 const ACTIONS = ["notify", "prompt", "shell", "message"] as const;
 const TYPES = ["once", "interval", "cron"] as const;
 const SCOPES = ["session", "cwd", "global"] as const;
-const WAKE_ON = ["always", "failure", "success", "never"] as const;
+const WAKE_ON = ["always", "failure", "success", "never", "change"] as const;
+const STOP_ON = ["success", "failure", "never"] as const;
 const MANAGE_ACTIONS = ["enable", "disable", "remove", "update", "cleanup"] as const;
 
 const STATE_FILE = process.env.PI_SCHEDULER_STATE_FILE || join(homedir(), ".pi", "agent", "state", "scheduler", "tasks.json");
@@ -119,6 +120,7 @@ function taskLabel(task: ScheduledTask): string {
 export default function schedulerExtension(pi: ExtensionAPI) {
 	let tasks: ScheduledTask[] = [];
 	let handles = new Map<string, TimerHandle>();
+	let expiryHandles = new Map<string, NodeJS.Timeout>();
 	let activeCtx: ExtensionContext | undefined;
 	let sessionGeneration = 0;
 	let stateRevision = -1;
@@ -154,14 +156,35 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 	function clearHandle(id: string): void {
 		const handle = handles.get(id);
-		if (!handle) return;
-		if (handle.kind === "cron") handle.handle.stop();
-		else clearTimeout(handle.handle);
+		if (handle?.kind === "cron") handle.handle.stop();
+		else if (handle) clearTimeout(handle.handle);
 		handles.delete(id);
+		const expiry = expiryHandles.get(id);
+		if (expiry) clearTimeout(expiry);
+		expiryHandles.delete(id);
 	}
 
 	function clearTimers(): void {
-		for (const id of [...handles.keys()]) clearHandle(id);
+		for (const id of new Set([...handles.keys(), ...expiryHandles.keys()])) clearHandle(id);
+	}
+
+	function scheduleExpiry(task: ScheduledTask, ctx: ExtensionContext, generation = sessionGeneration): void {
+		if (!task.expiresAt || task.status !== "pending" || !taskBelongsToSession(task, ctx)) return;
+		const deadline = Date.parse(task.expiresAt);
+		if (!Number.isFinite(deadline)) return;
+		const timer = setTimeout(() => {
+			expiryHandles.delete(task.id);
+			if (!isSessionActive(ctx, generation)) return;
+			void transactTasks((current) => {
+				if (!isSessionActive(ctx, generation)) return;
+				core.expireOverdueTasks(current.filter((item) => taskBelongsToSession(item, ctx)), new Date());
+			}).then(() => {
+				if (isSessionActive(ctx, generation)) rescheduleAll(generation);
+			}).catch((error: any) => {
+				if (isSessionActive(ctx, generation) && ctx.hasUI) ctx.ui.notify(`Scheduler expiry failed: ${error?.message ?? String(error)}`, "error");
+			});
+		}, Math.max(0, Math.min(deadline - Date.now(), MAX_TIMER_DELAY_MS)));
+		expiryHandles.set(task.id, timer);
 	}
 
 	function visibleTasks(ctx = activeCtx): ScheduledTask[] {
@@ -248,6 +271,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (!ctx || !isSessionActive(ctx, generation)) return;
 		clearTimers();
 		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx, generation);
+		for (const task of tasks) scheduleExpiry(task, ctx, generation);
 		updateStatus(ctx);
 	}
 
@@ -258,7 +282,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			store,
 			currentRevision: () => stateRevision,
 			isOwnerActive: isRunOwnerActive,
-			recoverInterrupted: core.recoverInterruptedTasks,
+			recoverInterrupted: (current: ScheduledTask[], now: Date, options: any) => {
+				core.expireOverdueTasks(current, now);
+				return core.recoverInterruptedTasks(current, now, options);
+			},
 			now: () => new Date(),
 			install: (nextTasks: ScheduledTask[], revision: number) => {
 				tasks = nextTasks;
@@ -348,6 +375,12 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`Running scheduled command: ${task.command}`, "info");
 
 			const result = await pi.exec("bash", ["-lc", task.command], { cwd, timeout });
+			const wakeOnChangeFingerprint = core.shellResultFingerprint({
+				stdout: result.stdout ?? "",
+				stderr: result.stderr ?? "",
+				code: result.code,
+				killed: result.killed,
+			});
 			const shellResult: Record<string, any> = {
 				ok: result.code === 0 && result.killed !== true,
 				command: task.command,
@@ -355,6 +388,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				timeoutMs: timeout,
 				code: result.code,
 				killed: result.killed,
+				wakeOnChangeFingerprint,
 				stdout: truncateMiddle(result.stdout ?? "", MAX_STORED_OUTPUT_CHARS),
 				stderr: truncateMiddle(result.stderr ?? "", MAX_STORED_OUTPUT_CHARS),
 			};
@@ -369,7 +403,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			shellResult.wakeReason = task.wakeOn ?? "never";
 			shellResult.wakeDisposition = "suppressed";
-			if (core.shouldWakeForShellResult(task, shellResult)) {
+			if (task.wakeOn !== "change" && core.shouldWakeForShellResult(task, shellResult)) {
 				const instruction = core.selectShellFollowUpPrompt(task, shellResult);
 				if (instruction) {
 					try {
@@ -410,11 +444,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				if (claimOptions?.expectedNextRun && persistedNextRun !== claimOptions.expectedNextRun) return undefined;
 				const dueAt = Date.parse(claimOptions?.occurrence ?? persistedNextRun ?? "");
 				if (!Number.isFinite(dueAt) || dueAt > Date.now()) return undefined;
+				const claimedAt = new Date();
+				if (!core.canClaimTask(candidate, claimedAt)) {
+					core.expireOverdueTasks([candidate], claimedAt);
+					return undefined;
+				}
 				if (claimOptions?.occurrence) {
 					candidate.nextRun = claimOptions.occurrence;
 					candidate.dueAt = claimOptions.occurrence;
 				}
-				core.markScheduledTaskRunning(current, candidate.id, new Date(), {
+				core.markScheduledTaskRunning(current, candidate.id, claimedAt, {
 					runOwner: { pid: process.pid, attemptId, sessionFile: currentSessionFile(ctx) },
 				});
 				return { ...candidate, runOwner: { ...candidate.runOwner } };
@@ -436,11 +475,31 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
+			let wakeOnChange = false;
+			let wakeTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
+				// A command/cwd or wake-policy edit while the process was running owns
+				// the new state; never let this stale result restore its baseline.
+				if (task?.wakeOn === "change" && result.wakeOnChangeFingerprint
+					&& persisted.enabled !== false && persisted.status === "running"
+					&& persisted.action === "shell"
+					&& persisted.wakeOn === "change"
+					&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision
+					&& persisted.command === task.command
+					&& (persisted.cwd ?? ctx.cwd) === (task.cwd ?? ctx.cwd)) {
+					wakeOnChange = core.shouldWakeForShellResult(persisted, result);
+					persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
+					persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
+					if (wakeOnChange) wakeTask = { ...persisted };
+				}
 				core.markScheduledTaskCompleted(current, persisted.id, new Date(), result, { ok: result.ok !== false });
 			});
+			if (wakeOnChange && wakeTask && isSessionActive(ctx, generation)) {
+				const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
+				if (instruction) sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+			}
 		} catch (error: any) {
 			let failedTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
@@ -531,9 +590,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		activeCtx = ctx;
 		const generation = ++sessionGeneration;
-		const interrupted = await transactTasks((current) =>
-			core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive }),
-		);
+		const interrupted = await transactTasks((current) => {
+			core.expireOverdueTasks(current, new Date());
+			return core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive });
+		});
 		if (!isSessionActive(ctx, generation)) return;
 
 		if (interrupted.length > 0 && ctx.hasUI) {
@@ -733,13 +793,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(SCOPES, { description: "Task scope. Default session.", default: "session" })),
 			enabled: Type.Optional(Type.Boolean({ description: "Whether the task starts enabled. Default true." })),
 			maxRuns: Type.Optional(Type.Number({ description: "Disable after this many runs. Useful for bounded polling.", minimum: 1 })),
+			backoff: Type.Optional(Type.Object({ factor: Type.Number({ description: "Multiplicative interval factor greater than 1." }), maxInterval: Type.String({ description: "Maximum interval, e.g. '15m'." }) })),
+			expiresIn: Type.Optional(Type.String({ description: "Optional positive duration after which this task expires (for example, '2h')." })),
 			message: Type.Optional(Type.String({ description: "Message for notify/message actions." })),
 			prompt: Type.Optional(Type.String({ description: "User prompt to inject for prompt actions." })),
 			command: Type.Optional(Type.String({ description: "Shell command to run for shell actions." })),
 			payload: Type.Optional(Type.String({ description: "Generic payload fallback for any action." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for shell actions; defaults to current cwd." })),
 			timeoutMs: Type.Optional(Type.Number({ description: "Shell timeout in milliseconds.", minimum: 1000 })),
-			wakeOn: Type.Optional(StringEnum(WAKE_ON, { description: "For shell actions: when to wake the agent. Default always if a prompt is configured, otherwise never." })),
+			wakeOn: Type.Optional(StringEnum(WAKE_ON, { description: "For shell actions: when to wake the agent. 'change' wakes after the first run only when stdout, stderr, exit status, or killed state changes. Default always if a prompt is configured, otherwise never." })),
+			stopOn: Type.Optional(StringEnum(STOP_ON, { description: "For shell actions: disable a recurring task after a matching result. Default never." })),
 			followUpPrompt: Type.Optional(
 				Type.String({ description: "For shell actions: generic follow-up instruction sent with stdout/stderr." }),
 			),
@@ -834,11 +897,14 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(SCOPES)),
 			enabled: Type.Optional(Type.Boolean()),
 			maxRuns: Type.Optional(Type.Number({ minimum: 1 })),
+			backoff: Type.Optional(Type.Union([Type.Object({ factor: Type.Number(), maxInterval: Type.String() }), Type.Null()])),
+			expiresIn: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			prompt: Type.Optional(Type.String()),
 			message: Type.Optional(Type.String()),
 			command: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ minimum: 1000 })),
 			wakeOn: Type.Optional(StringEnum(WAKE_ON)),
+			stopOn: Type.Optional(StringEnum(STOP_ON)),
 			followUpPrompt: Type.Optional(Type.String()),
 			successPrompt: Type.Optional(Type.String()),
 			failurePrompt: Type.Optional(Type.String()),
