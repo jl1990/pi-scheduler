@@ -48,7 +48,7 @@ function normalizeRunHistory(value) {
 		if (typeof entry.outcome.error === "string") outcome.error = entry.outcome.error.slice(0, 1000);
 		const clean = { attemptId: entry.attemptId, startedAt: new Date(entry.startedAt).toISOString(), completedAt: new Date(entry.completedAt).toISOString(), durationMs: entry.durationMs, outcome };
 		if (typeof entry.wakeReason === "string") clean.wakeReason = entry.wakeReason.slice(0, 120);
-		if (["delivered", "suppressed", "failed", "no-followup", "session-suppressed", "not-requested"].includes(entry.wakeDisposition)) clean.wakeDisposition = entry.wakeDisposition;
+		if (["delivered", "pending", "suppressed", "failed", "no-followup", "session-suppressed", "not-requested"].includes(entry.wakeDisposition)) clean.wakeDisposition = entry.wakeDisposition;
 		if (typeof entry.wakeError === "string") clean.wakeError = entry.wakeError.slice(0, 1000);
 		valid.set(clean.attemptId, clean);
 	}

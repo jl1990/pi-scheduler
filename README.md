@@ -95,7 +95,7 @@ Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `fo
 
 Ask Pi to list, update, disable, or remove tasks. Its tools are `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task`, and `manage_scheduled_task`.
 
-Completed runs keep a compact history of the latest 10 attempts (timestamps, duration, outcome, and wake disposition). Use `list_scheduled_tasks` with `includeHistory: true` (and optionally `id`) to inspect it; the default listing remains compact.
+Completed runs keep a compact history of the latest 10 attempts (timestamps, duration, outcome, and wake disposition). Use `list_scheduled_tasks` with `includeHistory: true` (and optionally `id`) to inspect it; the default listing remains compact. `delivered` means a wake was submitted to Pi, not that an agent turn finished; `pending` means delivery was not yet recorded.
 
 ```text
 /schedules                       # active tasks

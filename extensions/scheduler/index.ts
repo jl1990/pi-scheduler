@@ -475,6 +475,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
+			result.attemptId = attemptId;
 			let wakeOnChange = false;
 			let wakeTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
@@ -490,15 +491,40 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					&& persisted.command === task.command
 					&& (persisted.cwd ?? ctx.cwd) === (task.cwd ?? ctx.cwd)) {
 					wakeOnChange = core.shouldWakeForShellResult(persisted, result);
+					result.wakeDisposition = wakeOnChange ? "pending" : "suppressed";
 					persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
 					persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
 					if (wakeOnChange) wakeTask = { ...persisted };
 				}
 				core.markScheduledTaskCompleted(current, persisted.id, new Date(), result, { ok: result.ok !== false });
 			});
-			if (wakeOnChange && wakeTask && isSessionActive(ctx, generation)) {
-				const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
-				if (instruction) sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+			if (wakeOnChange && wakeTask) {
+				result.wakeDisposition = "session-suppressed";
+				if (isSessionActive(ctx, generation)) {
+					const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
+					result.wakeDisposition = "no-followup";
+					if (instruction) {
+						try {
+							sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+							result.wakeDisposition = "delivered";
+						} catch (error: any) {
+							result.wakeDisposition = "failed";
+							result.wakeError = String(error?.message ?? error).slice(0, 1000);
+						}
+					}
+				}
+				await transactTasks((current) => {
+					const persisted = current.find((candidate) => candidate.id === taskId);
+					const historyEntry = persisted?.history?.find((entry: any) => entry.attemptId === attemptId);
+					if (historyEntry) {
+						historyEntry.wakeDisposition = result.wakeDisposition;
+						if (result.wakeError) historyEntry.wakeError = result.wakeError;
+					}
+					if (persisted?.result?.attemptId === attemptId) {
+						persisted.result.wakeDisposition = result.wakeDisposition;
+						if (result.wakeError) persisted.result.wakeError = result.wakeError;
+					}
+				});
 			}
 		} catch (error: any) {
 			let failedTask: ScheduledTask | undefined;
