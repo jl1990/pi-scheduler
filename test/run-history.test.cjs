@@ -40,7 +40,10 @@ test("extension runtime records shell wake disposition and exposes history", asy
 	try {
 		await runtime.start();
 		const created = await runtime.call("schedule_task", { action: "shell", type: "interval", schedule: "1s", command: "check", wakeOn: "failure", followUpPrompt: "review", maxRuns: 2 });
-		await until(async () => (await runtime.tasks())[0]?.runCount >= 2, "two runtime runs");
+		await until(async () => {
+			const task = (await runtime.tasks())[0];
+			return task?.runCount >= 2 && task.history?.[1]?.wakeDisposition === "delivered";
+		}, "two runtime runs and persisted wake delivery");
 		const task = (await runtime.tasks())[0];
 		assert.equal(task.history.length, 2);
 		assert.equal(task.history[0].outcome.status, "success");
