@@ -19,7 +19,7 @@ const { Cron } = loadCroner();
 
 const VALID_ACTIONS = new Set(["notify", "prompt", "shell", "message"]);
 const VALID_TYPES = new Set(["once", "interval", "cron"]);
-const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed"]);
+const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed", "expired"]);
 const VALID_LAST_STATUSES = new Set(["success", "error", "running"]);
 const VALID_SCOPES = new Set(["session", "cwd", "global"]);
 const VALID_WAKE_ON = new Set(["always", "failure", "success", "never"]);
@@ -208,6 +208,15 @@ function validateTimeoutMs(value) {
 	return Math.round(n);
 }
 
+function expiryAtFromInput(value, nowValue = new Date()) {
+	const duration = typeof value === "string" ? parseDurationMs(value) : null;
+	const deadline = asDate(nowValue).getTime() + duration;
+	if (!Number.isSafeInteger(duration) || duration <= 0 || !Number.isFinite(new Date(deadline).getTime())) {
+		throw new Error("expiresIn must be a positive duration within the supported date range");
+	}
+	return new Date(deadline).toISOString();
+}
+
 function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 	const now = asDate(nowValue);
 	const type = normalizeType(typeValue);
@@ -334,6 +343,7 @@ function createScheduledTask(input, nowValue = new Date(), idFn = generateId) {
 	if (input.cwd) task.cwd = String(input.cwd);
 	if (input.sessionFile) task.sessionFile = String(input.sessionFile);
 	if (input.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(input.maxRuns);
+	if (input.expiresIn !== undefined) task.expiresAt = expiryAtFromInput(input.expiresIn, now);
 
 	const message = compactSpaces(input.message ?? input.payload ?? "");
 	const prompt = compactSpaces(input.prompt ?? input.payload ?? input.message ?? "");
@@ -372,7 +382,7 @@ function taskSummary(task) {
 }
 
 function isTerminal(task) {
-	return task.status === "fired" || task.status === "cancelled" || task.status === "failed";
+	return task.status === "fired" || task.status === "cancelled" || task.status === "failed" || task.status === "expired";
 }
 
 function normalizeTask(task, nowValue = new Date()) {
@@ -402,6 +412,15 @@ function normalizeTask(task, nowValue = new Date()) {
 	migrated.scope = VALID_SCOPES.has(task.scope) ? task.scope : task.sessionFile ? "session" : task.cwd ? "cwd" : "global";
 	migrated.whenText = compactSpaces(task.whenText ?? task.when ?? schedule);
 	migrated.createdAt = Number.isNaN(Date.parse(task.createdAt)) ? asDate(nowValue).toISOString() : task.createdAt;
+	if (task.expiresAt !== undefined) {
+		const expiry = Date.parse(task.expiresAt);
+		if (!Number.isFinite(expiry)) {
+			migrated.enabled = false;
+			migrated.status = "failed";
+			migrated.lastError = "Invalid persisted expiresAt";
+			delete migrated.nextRun;
+		} else migrated.expiresAt = new Date(expiry).toISOString();
+	}
 	if (task.maxRuns !== undefined) migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
 	if (task.lastStatus !== undefined && !VALID_LAST_STATUSES.has(task.lastStatus)) delete migrated.lastStatus;
 
@@ -465,9 +484,31 @@ function pendingTasks(tasks) {
 		.sort(sortByNextRun);
 }
 
+function canClaimTask(task, nowValue = new Date()) {
+	if (task?.expiresAt === undefined) return true;
+	const expiry = Date.parse(task.expiresAt);
+	return Number.isFinite(expiry) && asDate(nowValue).getTime() < expiry;
+}
+
+function expireOverdueTasks(tasks, nowValue = new Date()) {
+	const now = asDate(nowValue);
+	const expired = [];
+	for (const task of tasks) {
+		if (isTerminal(task) || task.status === "running" || !task.expiresAt || !Number.isFinite(Date.parse(task.expiresAt))) continue;
+		if (Date.parse(task.expiresAt) <= now.getTime()) {
+			task.enabled = false;
+			task.status = "expired";
+			task.expiredAt = now.toISOString();
+			task.nextRun = undefined;
+			expired.push(task);
+		}
+	}
+	return expired;
+}
+
 function dueTasks(tasks, nowValue = new Date()) {
 	const now = asDate(nowValue).getTime();
-	return pendingTasks(tasks).filter((task) => task.status === "pending" && Date.parse(task.nextRun ?? task.dueAt) <= now);
+	return pendingTasks(tasks).filter((task) => task.status === "pending" && canClaimTask(task, nowValue) && Date.parse(task.nextRun ?? task.dueAt) <= now);
 }
 
 function parseCatchUpOptions(env = {}) {
@@ -513,7 +554,7 @@ function selectCatchUpCronTasks(tasks, nowValue = new Date(), options = {}) {
 	if (!Number.isFinite(windowMs)) return [];
 
 	return tasks
-		.filter((task) => task.type === "cron" && task.enabled !== false && task.status === "pending")
+		.filter((task) => task.type === "cron" && task.enabled !== false && task.status === "pending" && canClaimTask(task, now))
 		.map((task) => ({ task, missedAt: latestMissedCronRun(task, now) }))
 		.filter((entry) => entry.missedAt && now.getTime() - entry.missedAt.getTime() <= windowMs)
 		.sort((a, b) => b.missedAt.getTime() - a.missedAt.getTime())
@@ -550,6 +591,8 @@ function disableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 function enableScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
+	if (task.status === "expired") throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
+	if (!canClaimTask(task, nowValue)) throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
 	if (task.status === "cancelled" || task.status === "failed" || task.status === "fired") task.status = "pending";
 	task.enabled = true;
 	const validated = validateTaskSchedule(task.type ?? "once", task.schedule ?? task.whenText ?? task.dueAt, nowValue);
@@ -572,11 +615,25 @@ function removeScheduledTask(tasks, idOrPrefix) {
 function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Date()) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
+	const renewed = updates.expiresIn !== undefined;
+	const newExpiry = renewed && updates.expiresIn !== null ? expiryAtFromInput(updates.expiresIn, nowValue) : undefined;
+	if (updates.enabled === true && !renewed && (task.status === "expired" || !canClaimTask(task, nowValue))) {
+		throw new Error(`Scheduled task ${task.id} is expired; renew expiresIn before enabling`);
+	}
 
 	if (updates.action !== undefined) task.action = normalizeAction(updates.action);
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
 	if (updates.enabled !== undefined) task.enabled = Boolean(updates.enabled);
+	if (renewed) {
+		if (newExpiry === undefined) delete task.expiresAt;
+		else task.expiresAt = newExpiry;
+		if (task.status === "expired") {
+			task.status = "pending";
+			task.enabled = updates.enabled === undefined ? true : Boolean(updates.enabled);
+			delete task.expiredAt;
+		}
+	}
 	if (updates.name !== undefined) task.name = compactSpaces(updates.name);
 	if (updates.title !== undefined) task.title = compactSpaces(updates.title);
 	if (updates.description !== undefined) task.description = compactSpaces(updates.description);
@@ -618,7 +675,7 @@ function markScheduledTaskRunning(tasks, idOrPrefix, nowValue = new Date(), opti
 	const now = asDate(nowValue);
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
-	if (task.enabled === false || isTerminal(task)) return task;
+	if (task.enabled === false || isTerminal(task) || !canClaimTask(task, now)) return task;
 	task.status = "running";
 	task.lastStatus = "running";
 	task.startedAt = now.toISOString();
@@ -634,6 +691,13 @@ function finishTaskAfterRun(task, now, ok, result) {
 	task.lastStatus = ok ? "success" : "error";
 	if (ok) delete task.lastError;
 	if (result !== undefined) task.result = result;
+	if (task.expiresAt && Date.parse(task.expiresAt) <= now.getTime()) {
+		task.enabled = false;
+		task.status = "expired";
+		task.expiredAt = now.toISOString();
+		task.nextRun = undefined;
+		return task;
+	}
 
 	const reachedMaxRuns = task.maxRuns !== undefined && task.runCount >= task.maxRuns;
 	if (task.type === "once" || reachedMaxRuns) {
@@ -799,7 +863,8 @@ function formatTaskLine(task, nowValue = new Date()) {
 	const next = task.nextRun ? `${formatRelativeTime(task.nextRun, nowValue)} (${new Date(task.nextRun).toLocaleString()})` : "no next run";
 	const enabled = task.enabled === false ? "disabled" : "enabled";
 	const last = task.lastStatus ? ` last=${task.lastStatus}` : "";
-	return `- ${task.id} ${label} next=${next} [${task.action}/${task.type}] ${enabled} status=${task.status} runs=${task.runCount ?? 0}${last} schedule=${formatSchedule(task)} :: ${taskSummary(task)}`;
+	const expiry = task.expiresAt ? ` expiresAt=${task.expiresAt}` : "";
+	return `- ${task.id} ${label} next=${next} [${task.action}/${task.type}] ${enabled} status=${task.status} runs=${task.runCount ?? 0}${last}${expiry} schedule=${formatSchedule(task)} :: ${taskSummary(task)}`;
 }
 
 function formatTaskList(tasks, nowValue = new Date(), options = {}) {
@@ -833,6 +898,8 @@ module.exports = {
 	sanitizeTasks,
 	taskMatchesScope,
 	pendingTasks,
+	canClaimTask,
+	expireOverdueTasks,
 	dueTasks,
 	parseCatchUpOptions,
 	selectCatchUpCronTasks,

@@ -56,6 +56,8 @@ Use a test command that finishes rather than entering watch mode. Every five min
 
 Recurring tasks do not stop when an external goal completes. Cancel them when finished, or bound them with `maxRuns`.
 
+Use `expiresIn: "2h"` to stop starting new runs after two hours. The absolute deadline persists across restarts. Expiry is silent and visible as `expired` in task history; an already-running command finishes with its usual wake policy. Renew an expired task with a new `expiresIn`, or set it to `null` in `manage_scheduled_task` to clear the deadline and resume it.
+
 ## Scheduling options
 
 | Option | Choices |
@@ -63,7 +65,7 @@ Recurring tasks do not stop when an external goal completes. Cancel them when fi
 | Action | `shell` runs a command; `prompt` wakes the agent; `notify` shows a reminder; `message` adds a custom message |
 | Schedule | `once`: `5m`, `tomorrow at 9am`, ISO datetime; `interval`: `30s`, `5m`, `1h`; `cron`: `0 0 9 * * 1-5` (weekdays at 9am) |
 | Scope | `session` (default): creating session; `cwd`: sessions in the same project directory; `global`: any session |
-| Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command |
+| Limits | `maxRuns` caps executions; `timeoutMs` bounds each shell command; `expiresIn` sets a positive lifetime (for example `2h`) |
 
 Cron uses `croner`; six-field expressions with seconds are recommended. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
 

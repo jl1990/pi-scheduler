@@ -119,6 +119,7 @@ function taskLabel(task: ScheduledTask): string {
 export default function schedulerExtension(pi: ExtensionAPI) {
 	let tasks: ScheduledTask[] = [];
 	let handles = new Map<string, TimerHandle>();
+	let expiryHandles = new Map<string, NodeJS.Timeout>();
 	let activeCtx: ExtensionContext | undefined;
 	let sessionGeneration = 0;
 	let stateRevision = -1;
@@ -154,14 +155,35 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 	function clearHandle(id: string): void {
 		const handle = handles.get(id);
-		if (!handle) return;
-		if (handle.kind === "cron") handle.handle.stop();
-		else clearTimeout(handle.handle);
+		if (handle?.kind === "cron") handle.handle.stop();
+		else if (handle) clearTimeout(handle.handle);
 		handles.delete(id);
+		const expiry = expiryHandles.get(id);
+		if (expiry) clearTimeout(expiry);
+		expiryHandles.delete(id);
 	}
 
 	function clearTimers(): void {
-		for (const id of [...handles.keys()]) clearHandle(id);
+		for (const id of new Set([...handles.keys(), ...expiryHandles.keys()])) clearHandle(id);
+	}
+
+	function scheduleExpiry(task: ScheduledTask, ctx: ExtensionContext, generation = sessionGeneration): void {
+		if (!task.expiresAt || task.status !== "pending" || !taskBelongsToSession(task, ctx)) return;
+		const deadline = Date.parse(task.expiresAt);
+		if (!Number.isFinite(deadline)) return;
+		const timer = setTimeout(() => {
+			expiryHandles.delete(task.id);
+			if (!isSessionActive(ctx, generation)) return;
+			void transactTasks((current) => {
+				if (!isSessionActive(ctx, generation)) return;
+				core.expireOverdueTasks(current.filter((item) => taskBelongsToSession(item, ctx)), new Date());
+			}).then(() => {
+				if (isSessionActive(ctx, generation)) rescheduleAll(generation);
+			}).catch((error: any) => {
+				if (isSessionActive(ctx, generation) && ctx.hasUI) ctx.ui.notify(`Scheduler expiry failed: ${error?.message ?? String(error)}`, "error");
+			});
+		}, Math.max(0, Math.min(deadline - Date.now(), MAX_TIMER_DELAY_MS)));
+		expiryHandles.set(task.id, timer);
 	}
 
 	function visibleTasks(ctx = activeCtx): ScheduledTask[] {
@@ -248,6 +270,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (!ctx || !isSessionActive(ctx, generation)) return;
 		clearTimers();
 		for (const task of core.pendingTasks(tasks)) scheduleTaskHandle(task, ctx, generation);
+		for (const task of tasks) scheduleExpiry(task, ctx, generation);
 		updateStatus(ctx);
 	}
 
@@ -258,7 +281,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			store,
 			currentRevision: () => stateRevision,
 			isOwnerActive: isRunOwnerActive,
-			recoverInterrupted: core.recoverInterruptedTasks,
+			recoverInterrupted: (current: ScheduledTask[], now: Date, options: any) => {
+				core.expireOverdueTasks(current, now);
+				return core.recoverInterruptedTasks(current, now, options);
+			},
 			now: () => new Date(),
 			install: (nextTasks: ScheduledTask[], revision: number) => {
 				tasks = nextTasks;
@@ -400,11 +426,16 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				if (claimOptions?.expectedNextRun && persistedNextRun !== claimOptions.expectedNextRun) return undefined;
 				const dueAt = Date.parse(claimOptions?.occurrence ?? persistedNextRun ?? "");
 				if (!Number.isFinite(dueAt) || dueAt > Date.now()) return undefined;
+				const claimedAt = new Date();
+				if (!core.canClaimTask(candidate, claimedAt)) {
+					core.expireOverdueTasks([candidate], claimedAt);
+					return undefined;
+				}
 				if (claimOptions?.occurrence) {
 					candidate.nextRun = claimOptions.occurrence;
 					candidate.dueAt = claimOptions.occurrence;
 				}
-				core.markScheduledTaskRunning(current, candidate.id, new Date(), {
+				core.markScheduledTaskRunning(current, candidate.id, claimedAt, {
 					runOwner: { pid: process.pid, attemptId, sessionFile: currentSessionFile(ctx) },
 				});
 				return { ...candidate, runOwner: { ...candidate.runOwner } };
@@ -521,9 +552,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		activeCtx = ctx;
 		const generation = ++sessionGeneration;
-		const interrupted = await transactTasks((current) =>
-			core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive }),
-		);
+		const interrupted = await transactTasks((current) => {
+			core.expireOverdueTasks(current, new Date());
+			return core.recoverInterruptedTasks(current, new Date(), { isOwnerActive: isRunOwnerActive });
+		});
 		if (!isSessionActive(ctx, generation)) return;
 
 		if (interrupted.length > 0 && ctx.hasUI) {
@@ -721,6 +753,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(SCOPES, { description: "Task scope. Default session.", default: "session" })),
 			enabled: Type.Optional(Type.Boolean({ description: "Whether the task starts enabled. Default true." })),
 			maxRuns: Type.Optional(Type.Number({ description: "Disable after this many runs. Useful for bounded polling.", minimum: 1 })),
+			expiresIn: Type.Optional(Type.String({ description: "Optional positive duration after which this task expires (for example, '2h')." })),
 			message: Type.Optional(Type.String({ description: "Message for notify/message actions." })),
 			prompt: Type.Optional(Type.String({ description: "User prompt to inject for prompt actions." })),
 			command: Type.Optional(Type.String({ description: "Shell command to run for shell actions." })),
@@ -815,6 +848,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			scope: Type.Optional(StringEnum(SCOPES)),
 			enabled: Type.Optional(Type.Boolean()),
 			maxRuns: Type.Optional(Type.Number({ minimum: 1 })),
+			expiresIn: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 			prompt: Type.Optional(Type.String()),
 			message: Type.Optional(Type.String()),
 			command: Type.Optional(Type.String()),
