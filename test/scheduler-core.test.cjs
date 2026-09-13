@@ -28,6 +28,8 @@ const {
 	recoverInterruptedTasks,
 	taskMatchesScope,
 	shouldWakeForShellResult,
+	normalizeStopOn,
+	VALID_STOP_ON,
 	formatAbsoluteTime,
 	expireOverdueTasks,
 	canClaimTask,
@@ -374,6 +376,51 @@ test("task lifecycle helpers update enabled state and recurrence metadata", () =
 	assert.throws(() => cancelScheduledTask(tasks, "missing", NOW), /not found/);
 	assert.equal(removeScheduledTask(tasks, "a").id, "a");
 	assert.equal(tasks.some((task) => task.id === "a"), false);
+});
+
+test("stopOn is shell-only, defaults to never, and stops recurring runs on matching results", () => {
+	assert.deepEqual([...VALID_STOP_ON], ["success", "failure", "never"]);
+	assert.equal(normalizeStopOn(undefined), "never");
+	assert.equal(normalizeStopOn(" SUCCESS "), "success");
+	assert.throws(() => normalizeStopOn("always"), /Invalid stopOn/);
+
+	const defaultTask = createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "true" }, NOW, () => "default");
+	assert.equal(defaultTask.stopOn, "never");
+	assert.throws(() => createScheduledTask({ action: "notify", type: "interval", schedule: "5m", message: "x", stopOn: "success" }, NOW), /stopOn.*shell/i);
+
+	const successTasks = [createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "true", stopOn: "success" }, NOW, () => "success")];
+	markScheduledTaskRunning(successTasks, "success", NOW);
+	const success = markScheduledTaskCompleted(successTasks, "success", NOW, { ok: true }, { ok: true });
+	assert.equal(success.status, "fired");
+	assert.equal(success.enabled, false);
+	assert.match(success.stopReason, /stopOn=success/);
+
+	const failureTasks = [createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "true", stopOn: "failure" }, NOW, () => "failure")];
+	markScheduledTaskRunning(failureTasks, "failure", NOW);
+	const failure = markScheduledTaskCompleted(failureTasks, "failure", NOW, { code: 0, killed: true });
+	assert.equal(failure.status, "failed");
+	assert.equal(failure.enabled, false);
+	assert.match(failure.stopReason, /stopOn=failure/);
+});
+
+test("stopOn survives sanitization and can be updated on shell tasks", () => {
+	const task = createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "true" }, NOW, () => "update");
+	assert.equal(updateScheduledTask([task], "update", { stopOn: "failure" }, NOW).stopOn, "failure");
+	assert.throws(() => updateScheduledTask([task], "update", { stopOn: "success", action: "notify" }, NOW), /stopOn.*shell/i);
+	const [migrated] = sanitizeTasks([{ ...task, stopOn: "success" }], NOW);
+	assert.equal(migrated.stopOn, "success");
+	const [legacyNonShell] = sanitizeTasks([{ ...task, action: "notify", message: "x", command: undefined, stopOn: "success" }], NOW);
+	assert.equal(legacyNonShell.stopOn, undefined);
+});
+
+test("a recurring task disabled while running is not stopped by its result", () => {
+	const tasks = [createScheduledTask({ action: "shell", type: "interval", schedule: "5m", command: "true", stopOn: "success" }, NOW, () => "inflight")];
+	markScheduledTaskRunning(tasks, "inflight", NOW);
+	disableScheduledTask(tasks, "inflight", NOW);
+	const completed = markScheduledTaskCompleted(tasks, "inflight", NOW, { ok: true }, { ok: true });
+	assert.equal(completed.status, "pending");
+	assert.equal(completed.enabled, false);
+	assert.equal(completed.nextRun, undefined);
 });
 
 test("failed recurring runs stay scheduled unless maxRuns is reached", () => {
