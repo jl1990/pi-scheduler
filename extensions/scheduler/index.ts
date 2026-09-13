@@ -403,18 +403,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 
 			shellResult.wakeReason = task.wakeOn ?? "never";
 			shellResult.wakeDisposition = "suppressed";
-			if (task.wakeOn !== "change" && core.shouldWakeForShellResult(task, shellResult)) {
-				const instruction = core.selectShellFollowUpPrompt(task, shellResult);
-				if (instruction) {
-					try {
-						sendAgentPrompt(pi, ctx, shellResultPrompt(task, shellResult, instruction));
-						shellResult.wakeDisposition = "delivered";
-					} catch (error: any) {
-						shellResult.wakeDisposition = "failed";
-						shellResult.wakeError = String(error?.message ?? error).slice(0, 1000);
-					}
-				} else shellResult.wakeDisposition = "no-followup";
-			}
 
 			return shellResult;
 		}
@@ -476,29 +464,35 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			updateStatus(ctx);
 			const result = await executeTask(task, ctx, () => isSessionActive(ctx, generation));
 			result.attemptId = attemptId;
-			let wakeOnChange = false;
+			let wakeRequested = false;
 			let wakeTask: ScheduledTask | undefined;
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
-				// A command/cwd or wake-policy edit while the process was running owns
-				// the new state; never let this stale result restore its baseline.
-				if (task?.wakeOn === "change" && result.wakeOnChangeFingerprint
-					&& persisted.enabled !== false && persisted.status === "running"
-					&& persisted.action === "shell"
-					&& persisted.wakeOn === "change"
-					&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision
-					&& persisted.command === task.command
-					&& (persisted.cwd ?? ctx.cwd) === (task.cwd ?? ctx.cwd)) {
-					wakeOnChange = core.shouldWakeForShellResult(persisted, result);
-					result.wakeDisposition = wakeOnChange ? "pending" : "suppressed";
-					persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
-					persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
-					if (wakeOnChange) wakeTask = { ...persisted };
+				// The current configuration wins over the snapshot that launched the
+				// command, including A -> B -> A edits while it was running.
+				result.superseded = persisted.executionRevision !== task?.executionRevision
+					|| persisted.action !== task?.action || persisted.command !== task?.command
+					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+				if (task?.action === "shell" && !result.superseded
+					&& persisted.enabled !== false && persisted.status === "running") {
+					result.wakeReason = persisted.wakeOn ?? "never";
+					if (persisted.wakeOn !== "change") {
+						wakeRequested = core.shouldWakeForShellResult(persisted, result);
+					} else if (task.wakeOn === "change" && result.wakeOnChangeFingerprint
+						&& persisted.wakeOnChangeRevision === task.wakeOnChangeRevision) {
+						wakeRequested = core.shouldWakeForShellResult(persisted, result);
+						persisted.lastResultFingerprint = result.wakeOnChangeFingerprint;
+						persisted.wakeOnChangeKey = `${task.command ?? ""}\0${task.cwd ?? ctx.cwd}`;
+					}
+					if (wakeRequested) {
+						result.wakeDisposition = "pending";
+						wakeTask = { ...persisted };
+					}
 				}
 				core.markScheduledTaskCompleted(current, persisted.id, new Date(), result, { ok: result.ok !== false });
 			});
-			if (wakeOnChange && wakeTask) {
+			if (wakeRequested && wakeTask) {
 				result.wakeDisposition = "session-suppressed";
 				if (isSessionActive(ctx, generation)) {
 					const instruction = core.selectShellFollowUpPrompt(wakeTask, result);
@@ -531,7 +525,10 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			await transactTasks((current) => {
 				const persisted = current.find((candidate) => candidate.id === taskId);
 				if (persisted?.runOwner?.attemptId !== attemptId) return;
-				core.markScheduledTaskFailed(current, persisted.id, new Date(), error);
+				const superseded = persisted.executionRevision !== task?.executionRevision
+					|| persisted.action !== task?.action || persisted.command !== task?.command
+					|| (persisted.cwd ?? ctx.cwd) !== (task?.cwd ?? ctx.cwd);
+				core.markScheduledTaskFailed(current, persisted.id, new Date(), error, { superseded });
 				failedTask = { ...persisted };
 			});
 			if (failedTask && isSessionActive(ctx, generation)) {

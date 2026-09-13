@@ -87,7 +87,7 @@ Cron uses `croner`; six-field expressions with seconds are recommended. Use `ses
 
 Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `followUpPrompt` for either outcome. The wake policy is checked first. Without an explicit policy, supplying a prompt defaults to `always`; otherwise the default is `never`. An explicit matching policy without a custom prompt uses a default review instruction.
 
-`change` stores a SHA-256 fingerprint of the complete (untruncated) shell result in task state. The first run establishes the baseline without waking; repeated identical results stay quiet. Editing the command, working directory, or opting into `change` starts a new baseline.
+`change` stores a SHA-256 fingerprint of the complete (untruncated) shell result in task state. The first run establishes the baseline without waking; repeated identical results stay quiet. Editing the command, working directory, or opting into `change` starts a new baseline. If that first run matches `stopOn`, the task stops silently; use `success` or `failure` when the stopping result must wake the agent.
 
 **Exit status matters.** A command that prints a failed CI pipeline may still exit 0. For CI polling, use a command or wrapper that maps pipeline states to the intended exit status; pending is not automatically a separate state.
 

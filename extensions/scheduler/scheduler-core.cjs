@@ -480,7 +480,9 @@ function normalizeTask(task, nowValue = new Date()) {
 		if (!Number.isFinite(expiry)) {
 			migrated.enabled = false;
 			migrated.status = "failed";
+			migrated.lastStatus = "error";
 			migrated.lastError = "Invalid persisted expiresAt";
+			delete migrated.expiresAt;
 			delete migrated.nextRun;
 		} else migrated.expiresAt = new Date(expiry).toISOString();
 	}
@@ -711,7 +713,7 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	const scheduleChanged = updates.schedule !== undefined || updates.when !== undefined || updates.whenText !== undefined || updates.type !== undefined;
-	const resetBackoff = scheduleChanged || updates.backoff !== undefined;
+	const resetBackoff = scheduleChanged || updates.backoff !== undefined || updates.enabled === true;
 	let nextBackoff = task.backoff;
 	if (resetBackoff) {
 		const nextType = updates.type !== undefined ? normalizeType(updates.type) : task.type;
@@ -729,6 +731,7 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 
 	const nextAction = updates.action !== undefined ? normalizeAction(updates.action) : task.action;
 	if (updates.stopOn !== undefined && nextAction !== "shell") throw new Error("stopOn is only supported for shell scheduled tasks");
+	if (nextAction !== task.action) task.executionRevision = randomUUID();
 	if (updates.action !== undefined) task.action = nextAction;
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
@@ -749,6 +752,7 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.cwd !== undefined) {
 		const cwd = String(updates.cwd);
 		if (cwd !== task.cwd) {
+			task.executionRevision = randomUUID();
 			delete task.lastResultFingerprint;
 			delete task.wakeOnChangeKey;
 			task.wakeOnChangeRevision = randomUUID();
@@ -784,6 +788,7 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.command !== undefined) {
 		const command = compactSpaces(updates.command);
 		if (command !== task.command) {
+			task.executionRevision = randomUUID();
 			delete task.lastResultFingerprint;
 			delete task.wakeOnChangeKey;
 			task.wakeOnChangeRevision = randomUUID();
@@ -847,7 +852,7 @@ function finishTaskAfterRun(task, now, ok, result) {
 
 	const reachedMaxRuns = task.maxRuns !== undefined && task.runCount >= task.maxRuns;
 	const stopOn = task.action === "shell" ? normalizeStopOn(task.stopOn) : "never";
-	const stoppedOnResult = stopOn !== "never" && ((stopOn === "success" && ok) || (stopOn === "failure" && !ok));
+	const stoppedOnResult = result?.superseded !== true && stopOn !== "never" && ((stopOn === "success" && ok) || (stopOn === "failure" && !ok));
 	if (task.type === "once" || reachedMaxRuns || (!remainDisabled && stoppedOnResult)) {
 		task.enabled = false;
 		task.status = ok ? "fired" : "failed";
@@ -911,7 +916,7 @@ function markScheduledTaskFired(tasks, idOrPrefix, nowValue = new Date(), result
 	return markScheduledTaskCompleted(tasks, idOrPrefix, nowValue, result, { ok: true });
 }
 
-function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error) {
+function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error, options = {}) {
 	const task = findTask(tasks, idOrPrefix);
 	if (!task) throw new Error(`Scheduled task not found: ${idOrPrefix}`);
 	if (task.status === "cancelled") {
@@ -922,7 +927,7 @@ function markScheduledTaskFailed(tasks, idOrPrefix, nowValue = new Date(), error
 		return task;
 	}
 	task.lastError = error instanceof Error ? error.message : String(error);
-	return finishTaskAfterRun(task, asDate(nowValue), false, { error: task.lastError, interrupted: task.interruptedRun, wakeReason: task.interruptedRun ? "interrupted" : "execution-error", wakeDisposition: "not-requested" });
+	return finishTaskAfterRun(task, asDate(nowValue), false, { error: task.lastError, superseded: options.superseded === true, interrupted: task.interruptedRun, wakeReason: task.interruptedRun ? "interrupted" : "execution-error", wakeDisposition: "not-requested" });
 }
 
 function recoverInterruptedTasks(tasks, nowValue = new Date(), options = {}) {
