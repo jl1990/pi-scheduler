@@ -1,5 +1,6 @@
 const { realpathSync } = require("node:fs");
 const { createRequire } = require("node:module");
+const { createHash, randomUUID } = require("node:crypto");
 
 function loadCroner() {
 	try {
@@ -22,7 +23,7 @@ const VALID_TYPES = new Set(["once", "interval", "cron"]);
 const VALID_STATUSES = new Set(["pending", "running", "fired", "cancelled", "failed"]);
 const VALID_LAST_STATUSES = new Set(["success", "error", "running"]);
 const VALID_SCOPES = new Set(["session", "cwd", "global"]);
-const VALID_WAKE_ON = new Set(["always", "failure", "success", "never"]);
+const VALID_WAKE_ON = new Set(["always", "failure", "success", "never", "change"]);
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -431,6 +432,11 @@ function normalizeTask(task, nowValue = new Date()) {
 		} catch {
 			migrated.wakeOn = hasShellPrompt ? "always" : "never";
 		}
+		if (typeof migrated.lastResultFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(migrated.lastResultFingerprint)) {
+			delete migrated.lastResultFingerprint;
+		}
+		if (typeof migrated.wakeOnChangeKey !== "string") delete migrated.wakeOnChangeKey;
+		if (typeof migrated.wakeOnChangeRevision !== "string") delete migrated.wakeOnChangeRevision;
 	}
 
 	return migrated;
@@ -581,17 +587,41 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.title !== undefined) task.title = compactSpaces(updates.title);
 	if (updates.description !== undefined) task.description = compactSpaces(updates.description);
 	if (updates.maxRuns !== undefined) task.maxRuns = normalizeMaxRuns(updates.maxRuns);
-	if (updates.cwd !== undefined) task.cwd = String(updates.cwd);
+	if (updates.cwd !== undefined) {
+		const cwd = String(updates.cwd);
+		if (cwd !== task.cwd) {
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.cwd = cwd;
+	}
 	if (updates.sessionFile === null) delete task.sessionFile;
 	else if (updates.sessionFile !== undefined) task.sessionFile = String(updates.sessionFile);
 	if (updates.timeoutMs !== undefined) task.timeoutMs = validateTimeoutMs(updates.timeoutMs);
 	if (updates.followUpPrompt !== undefined) task.followUpPrompt = compactSpaces(updates.followUpPrompt) || undefined;
 	if (updates.successPrompt !== undefined) task.successPrompt = compactSpaces(updates.successPrompt) || undefined;
 	if (updates.failurePrompt !== undefined) task.failurePrompt = compactSpaces(updates.failurePrompt) || undefined;
-	if (updates.wakeOn !== undefined) task.wakeOn = normalizeWakeOn(updates.wakeOn, true);
+	if (updates.wakeOn !== undefined) {
+		const wakeOn = normalizeWakeOn(updates.wakeOn, true);
+		if (wakeOn === "change" && task.wakeOn !== "change") {
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.wakeOn = wakeOn;
+	}
 	if (updates.prompt !== undefined) task.prompt = compactSpaces(updates.prompt);
 	if (updates.message !== undefined) task.message = compactSpaces(updates.message);
-	if (updates.command !== undefined) task.command = compactSpaces(updates.command);
+	if (updates.command !== undefined) {
+		const command = compactSpaces(updates.command);
+		if (command !== task.command) {
+			delete task.lastResultFingerprint;
+			delete task.wakeOnChangeKey;
+			task.wakeOnChangeRevision = randomUUID();
+		}
+		task.command = command;
+	}
 	if (updates.triggerTurn !== undefined) task.triggerTurn = Boolean(updates.triggerTurn);
 
 	if (updates.schedule !== undefined || updates.when !== undefined || updates.whenText !== undefined || updates.type !== undefined) {
@@ -723,6 +753,20 @@ function shellResultOk(result) {
 	return true;
 }
 
+// Hash the complete command result before any UI/state output truncation. JSON
+// framing keeps stdout/stderr and status values unambiguous.
+function shellResultFingerprint(result) {
+	if (typeof result?.wakeOnChangeFingerprint === "string") return result.wakeOnChangeFingerprint;
+	return createHash("sha256")
+		.update(JSON.stringify([
+			String(result?.stdout ?? ""),
+			String(result?.stderr ?? ""),
+			result?.code ?? null,
+			Boolean(result?.killed),
+		]))
+		.digest("hex");
+}
+
 function hasShellFollowUpPrompt(task) {
 	return Boolean(task.followUpPrompt || task.successPrompt || task.failurePrompt);
 }
@@ -735,6 +779,13 @@ function shouldWakeForShellResult(task, result) {
 	if (wakeOn === "always") return true;
 	if (wakeOn === "success") return ok;
 	if (wakeOn === "failure") return !ok;
+	if (wakeOn === "change") {
+		const fingerprint = shellResultFingerprint(result);
+		const key = `${task.command ?? ""}\0${task.cwd ?? result.cwd ?? ""}`;
+		const changed = task.wakeOnChangeKey === key && task.lastResultFingerprint !== undefined
+			&& task.lastResultFingerprint !== fingerprint;
+		return changed;
+	}
 	return false;
 }
 
@@ -837,6 +888,7 @@ module.exports = {
 	parseCatchUpOptions,
 	selectCatchUpCronTasks,
 	recoverInterruptedTasks,
+	shellResultFingerprint,
 	cancelScheduledTask,
 	disableScheduledTask,
 	enableScheduledTask,
