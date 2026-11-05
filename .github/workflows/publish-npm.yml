@@ -22,17 +22,23 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
+          cache: pnpm
           registry-url: https://registry.npmjs.org
-      - name: Validate package metadata
-        run: npm install --package-lock=false --ignore-scripts
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Run tests
-        run: npm test
-      - name: Check npm package contents
-        run: npm pack --dry-run
+        run: pnpm test
+      - name: Pack tarball
+        # pnpm flattens the bundled dependencies out of its symlinked node_modules;
+        # npm then publishes that exact tarball with provenance (OIDC or NPM_TOKEN).
+        run: |
+          pnpm pack --pack-destination "$RUNNER_TEMP/package"
+          echo "PACKAGE_TARBALL=$(ls "$RUNNER_TEMP"/package/*.tgz)" >> "$GITHUB_ENV"
       - name: Prepare npm auth
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -45,11 +51,11 @@ jobs:
           fi
       - name: Publish dry run
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
-        run: npm publish --dry-run --access public
+        run: npm publish "$PACKAGE_TARBALL" --dry-run --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish to npm
         if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
-        run: npm publish --provenance --access public
+        run: npm publish "$PACKAGE_TARBALL" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

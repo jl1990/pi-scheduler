@@ -32,8 +32,9 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.cjs",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "pnpm pack --dry-run"
   },
+  "packageManager": "pnpm@12.16.1",
   "publishConfig": {
     "access": "public"
   },
@@ -63,7 +64,7 @@
     }
   },
   "dependencies": {
-    "croner": "10.0.1",
+    "croner": "11.0.0",
     "proper-lockfile": "4.1.2"
   },
   "bundleDependencies": [

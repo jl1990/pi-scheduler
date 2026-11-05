@@ -133,8 +133,9 @@ Interrupted executions are recorded as failed: one-shot tasks remain failed, whi
 ## Development
 
 ```bash
-npm test
-npm pack --dry-run
+pnpm install
+pnpm test
+pnpm pack --dry-run
 PI_OFFLINE=1 pi --no-extensions -e ./extensions/scheduler/index.ts --list-models __unlikely_model_filter__
 ```
 
