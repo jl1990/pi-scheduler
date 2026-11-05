@@ -23,6 +23,8 @@ const MANAGE_ACTIONS = ["enable", "disable", "remove", "update", "cleanup"] as c
 const STATE_FILE = process.env.PI_SCHEDULER_STATE_FILE || join(homedir(), ".pi", "agent", "state", "scheduler", "tasks.json");
 const MAX_TIMER_DELAY_MS = 2_147_483_647; // setTimeout's practical max (~24.8 days)
 const STATE_REFRESH_INTERVAL_MS = 5_000;
+// The widget shows second-level countdowns, so re-render it as time passes.
+const WIDGET_TICK_INTERVAL_MS = 1_000;
 const DEFAULT_SHELL_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_STORED_OUTPUT_CHARS = 12_000;
 const MAX_PROMPT_OUTPUT_CHARS = 18_000;
@@ -125,6 +127,8 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	let sessionGeneration = 0;
 	let stateRevision = -1;
 	let widgetEnabled = true;
+	let renderedWidget: string | undefined;
+	let widgetTick: ReturnType<typeof setInterval> | undefined;
 	let rescheduleAfterRefresh = false;
 	const firing = new Set<string>();
 	const abandonedAttempts = new Set<string>();
@@ -206,16 +210,24 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		return tasks.filter((task) => taskBelongsToSession(task, ctx));
 	}
 
-	function updateWidget(ctx = activeCtx): void {
+	function setWidgetLines(ctx: ExtensionContext, lines: string[] | undefined, onlyIfChanged: boolean): void {
+		const rendered = lines?.join("\n");
+		if (onlyIfChanged && rendered === renderedWidget) return;
+		renderedWidget = rendered;
+		if (lines) ctx.ui.setWidget("scheduler", lines, { placement: "belowEditor" });
+		else ctx.ui.setWidget("scheduler", undefined);
+	}
+
+	function updateWidget(ctx = activeCtx, onlyIfChanged = false): void {
 		if (!ctx?.hasUI) return;
 		if (!widgetEnabled) {
-			ctx.ui.setWidget("scheduler", undefined);
+			setWidgetLines(ctx, undefined, onlyIfChanged);
 			return;
 		}
 
 		const upcoming = core.pendingTasks(visibleTasks(ctx)).slice(0, 3);
 		if (upcoming.length === 0) {
-			ctx.ui.setWidget("scheduler", undefined);
+			setWidgetLines(ctx, undefined, onlyIfChanged);
 			return;
 		}
 
@@ -227,7 +239,26 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			const last = task.lastStatus ? ` last=${task.lastStatus}` : "";
 			lines.push(`  ✓ ${taskLabel(task)} ${task.action}/${task.type} ${when} runs=${task.runCount ?? 0}${last}`);
 		}
-		ctx.ui.setWidget("scheduler", lines, { placement: "belowEditor" });
+		setWidgetLines(ctx, lines, onlyIfChanged);
+	}
+
+	function stopWidgetTick(): void {
+		if (widgetTick !== undefined) clearInterval(widgetTick);
+		widgetTick = undefined;
+		renderedWidget = undefined;
+	}
+
+	function startWidgetTick(ctx: ExtensionContext, generation: number): void {
+		stopWidgetTick();
+		if (!ctx.hasUI) return;
+		widgetTick = setInterval(() => {
+			try {
+				if (isSessionActive(ctx, generation)) updateWidget(ctx, true);
+			} catch {
+				// A closed UI must not turn a cosmetic refresh into an uncaught exception.
+			}
+		}, WIDGET_TICK_INTERVAL_MS);
+		widgetTick?.unref?.();
 	}
 
 	function updateStatus(ctx = activeCtx): void {
@@ -661,6 +692,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		}
 
 		rescheduleAll(generation);
+		startWidgetTick(ctx, generation);
 		startStateRefresh(generation);
 		const catchUpOptions = core.parseCatchUpOptions(process.env);
 		runInBackground(() => catchUpOverdueCronTasks(ctx, generation, catchUpOptions), ctx, generation, "Failed to catch up missed cron tasks");
@@ -669,6 +701,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		++sessionGeneration;
 		clearTimers();
+		stopWidgetTick();
 		refreshLoop.stop();
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("scheduler", undefined);
