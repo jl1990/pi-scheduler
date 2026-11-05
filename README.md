@@ -115,6 +115,8 @@ To create tasks directly:
 /schedule [notify|prompt|shell|message] [once|interval|cron|every] <schedule> :: <payload>
 ```
 
+Task ids accept a unique prefix; an ambiguous prefix is rejected. `::` is optional for one-shot and interval schedules (`/schedule prompt every 5m check CI`) but required for cron. A date-only schedule such as `2026-12-01` means local midnight.
+
 ## Persistence and recovery
 
 Tasks live in `~/.pi/agent/state/scheduler/tasks.json`. Atomic state transactions and task claims coordinate execution across Pi processes; shared state refreshes every five seconds.

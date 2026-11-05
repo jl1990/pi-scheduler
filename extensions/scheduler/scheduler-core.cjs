@@ -182,6 +182,12 @@ function parseClockExpression(text, now) {
 	return target.getTime();
 }
 
+function localDateMs(year, month, day) {
+	const date = new Date(year, month - 1, day, 0, 0, 0, 0);
+	if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return Number.NaN;
+	return date.getTime();
+}
+
 function parseWhen(text, nowValue = new Date()) {
 	const now = asDate(nowValue);
 	const input = compactSpaces(text);
@@ -198,7 +204,9 @@ function parseWhen(text, nowValue = new Date()) {
 		return { dueAtMs: clockMs, kind: "clock", normalized: input };
 	}
 
-	const absoluteMs = Date.parse(input);
+	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input);
+	// Date.parse reads bare ISO dates as UTC midnight; users mean their local midnight.
+	const absoluteMs = dateOnly ? localDateMs(Number(dateOnly[1]), Number(dateOnly[2]), Number(dateOnly[3])) : Date.parse(input);
 	if (!Number.isNaN(absoluteMs)) {
 		if (absoluteMs <= now.getTime()) throw new Error(`Scheduled time is in the past: ${input}`);
 		return { dueAtMs: absoluteMs, kind: "absolute", normalized: input };
@@ -280,8 +288,13 @@ function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 	const schedule = compactSpaces(scheduleValue);
 	if (!schedule) throw new Error("schedule is required");
 
+	const assertInRange = (ms) => {
+		if (!Number.isFinite(new Date(ms).getTime())) throw new Error(`Schedule is outside the supported date range: ${schedule}`);
+	};
+
 	if (type === "once") {
 		const parsed = parseWhen(schedule, now);
+		assertInRange(parsed.dueAtMs);
 		const nextRun = new Date(parsed.dueAtMs).toISOString();
 		return { type, schedule, nextRun, dueAt: nextRun, dueAtMs: parsed.dueAtMs, scheduleKind: parsed.kind };
 	}
@@ -289,6 +302,7 @@ function validateTaskSchedule(typeValue, scheduleValue, nowValue = new Date()) {
 	if (type === "interval") {
 		const intervalMs = parseDurationMs(schedule);
 		if (!intervalMs) throw new Error(`Invalid interval schedule: ${schedule}`);
+		assertInRange(now.getTime() + intervalMs);
 		const nextRun = new Date(now.getTime() + intervalMs).toISOString();
 		return { type, schedule, intervalMs, nextRun, dueAt: nextRun };
 	}
@@ -345,6 +359,13 @@ function splitScheduleCommand(args, nowValue = new Date()) {
 		action = tokens[0].toLowerCase();
 		restTokens = tokens.slice(1);
 	}
+	let type = "once";
+	const typeToken = restTokens[0]?.toLowerCase();
+	if (typeToken === "every") type = "interval";
+	else if (VALID_TYPES.has(typeToken)) type = typeToken;
+	if (type !== "once" || typeToken === "once") restTokens = restTokens.slice(1);
+	// Cron fields and payload words cannot be told apart reliably (e.g. "0 9 * * 1 2 builds").
+	if (type === "cron") throw new Error("Cron schedules need a separator: /schedule [action] cron <expression> :: <payload>");
 
 	const maxPrefix = Math.min(restTokens.length - 1, 10);
 	let bestMatch = null;
@@ -353,8 +374,8 @@ function splitScheduleCommand(args, nowValue = new Date()) {
 		const payload = restTokens.slice(i).join(" ").trim();
 		if (!payload) continue;
 		try {
-			validateTaskSchedule("once", schedule, nowValue);
-			bestMatch = { action, type: "once", schedule, whenText: schedule, payload };
+			validateTaskSchedule(type, schedule, nowValue);
+			bestMatch = { action, type, schedule, whenText: schedule, payload };
 		} catch {
 			// Try a longer prefix.
 		}
@@ -486,7 +507,18 @@ function normalizeTask(task, nowValue = new Date()) {
 			delete migrated.nextRun;
 		} else migrated.expiresAt = new Date(expiry).toISOString();
 	}
-	if (task.maxRuns !== undefined) migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
+	if (task.maxRuns !== undefined) {
+		try {
+			migrated.maxRuns = normalizeMaxRuns(task.maxRuns);
+		} catch (error) {
+			delete migrated.maxRuns;
+			migrated.enabled = false;
+			migrated.status = "failed";
+			migrated.lastStatus = "error";
+			migrated.lastError = `Invalid persisted maxRuns: ${error.message}`;
+			delete migrated.nextRun;
+		}
+	}
 	if (task.lastStatus !== undefined && !VALID_LAST_STATUSES.has(task.lastStatus)) delete migrated.lastStatus;
 
 	try {
@@ -657,7 +689,14 @@ function selectCatchUpCronTasks(tasks, nowValue = new Date(), options = {}) {
 
 function findTask(tasks, idOrPrefix) {
 	const id = compactSpaces(idOrPrefix);
-	return tasks.find((task) => task.id === id || task.id.startsWith(id));
+	if (!id) throw new Error("Scheduled task id or prefix is required");
+	const exact = tasks.find((task) => task.id === id);
+	if (exact) return exact;
+	const matches = tasks.filter((task) => task.id.startsWith(id));
+	if (matches.length > 1) {
+		throw new Error(`Scheduled task id prefix is ambiguous: ${id} (matches ${matches.map((task) => task.id).join(", ")})`);
+	}
+	return matches[0];
 }
 
 function cancelScheduledTask(tasks, idOrPrefix, nowValue = new Date()) {
@@ -736,6 +775,10 @@ function updateScheduledTask(tasks, idOrPrefix, updates = {}, nowValue = new Dat
 	if (updates.type !== undefined) task.type = normalizeType(updates.type);
 	if (updates.scope !== undefined) task.scope = normalizeScope(updates.scope);
 	if (updates.enabled !== undefined) task.enabled = Boolean(updates.enabled);
+	if (updates.enabled === true && (task.status === "cancelled" || task.status === "failed" || task.status === "fired")) {
+		task.status = "pending";
+		delete task.stopReason;
+	}
 	if (renewed) {
 		if (newExpiry === undefined) delete task.expiresAt;
 		else task.expiresAt = newExpiry;
@@ -1077,6 +1120,7 @@ function formatTaskList(tasks, nowValue = new Date(), options = {}) {
 }
 
 module.exports = {
+	findTask,
 	VALID_ACTIONS,
 	VALID_TYPES,
 	VALID_STATUSES,

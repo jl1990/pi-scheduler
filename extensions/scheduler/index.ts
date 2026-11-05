@@ -941,9 +941,9 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			await loadTasks();
 			let visible = visibleTasks(ctx);
 			if (params.id) {
-				const matches = visible.filter((task) => task.id === params.id || task.id.startsWith(params.id));
-				if (matches.length !== 1) throw new Error(`Scheduled task not found or prefix is ambiguous: ${params.id}`);
-				visible = matches;
+				const match = core.findTask(visible, params.id);
+				if (!match) throw new Error(`Scheduled task not found: ${params.id}`);
+				visible = [match];
 			}
 			const text = core.formatTaskList(visible, new Date(), { includeAll: Boolean(params.includeAll || params.id || params.includeHistory), includeHistory: Boolean(params.includeHistory) });
 			updateStatus(ctx);
