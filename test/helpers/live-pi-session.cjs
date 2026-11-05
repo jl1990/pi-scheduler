@@ -13,7 +13,9 @@ function installedPiPackage() {
 	while (current !== path.dirname(current)) {
 		if (fs.existsSync(path.join(current, "package.json"))) {
 			const pkg = JSON.parse(fs.readFileSync(path.join(current, "package.json"), "utf8"));
-			if (pkg.name === "@earendil-works/pi-coding-agent") return current;
+			// pnpm global installs link packages from a store; resolve Pi's own
+			// dependencies (typebox) from the real location, not the link.
+			if (pkg.name === "@earendil-works/pi-coding-agent") return fs.realpathSync(current);
 		}
 		current = path.dirname(current);
 	}
