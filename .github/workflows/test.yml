@@ -12,13 +12,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - name: Validate package metadata
-        run: npm install --package-lock=false --ignore-scripts
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Run tests
-        run: npm test
+        run: pnpm test
       - name: Check npm package contents
-        run: npm pack --dry-run
+        run: pnpm pack --dry-run

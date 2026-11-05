@@ -37,7 +37,7 @@ for (const scenario of ["timeout", "cron", "invalid-cron", "throwing-reporter", 
 				},
 				setTimeout: callback => { timerRegistrations++; timerCallback = callback; return {}; },
 				clearTimeout: () => {},
-				setInterval: callback => { refreshCallback = callback; return { unref() {} }; },
+				setInterval: (callback, delay) => { if (delay === 5000) refreshCallback = callback; return { unref() {} }; },
 				clearInterval: () => {},
 				Cron: class {
 					constructor(schedule, callback) {
