@@ -162,3 +162,33 @@ test("stale lock owned by a dead process is recovered", async (t) => {
 	await store.transact((tasks) => tasks.push({ id: "recovered" }));
 	assert.deepEqual((await store.read()).tasks, [{ id: "recovered" }]);
 });
+
+test("locking survives a host that exposes fs modules through a lazy Proxy", async (t) => {
+	// Reproduces issue #13: proper-lockfile caches mtime precision on the fs object with a
+	// non-configurable property. When the host hands out fs through a Proxy whose `get`
+	// reads from a different object, reading that cache back breaks a Proxy invariant
+	// inside an fs callback and terminates the process.
+	const dir = await mkdtemp(join(tmpdir(), "pi-scheduler-proxied-fs-"));
+	t.after(() => rm(dir, { recursive: true, force: true }));
+	const modulePath = resolve(__dirname, "../extensions/scheduler/task-store.cjs");
+	const script = `
+		const Module = require('node:module');
+		const load = Module._load;
+		const proxies = new Map();
+		Module._load = function (request, ...rest) {
+			const loaded = load.call(this, request, ...rest);
+			if (request !== 'graceful-fs') return loaded;
+			if (!proxies.has(loaded)) proxies.set(loaded, new Proxy({}, { get: (_, key) => loaded[key] }));
+			return proxies.get(loaded);
+		};
+		const { createTaskStore } = require(process.argv[1]);
+		const store = createTaskStore({ stateFile: process.argv[2] });
+		(async () => {
+			await store.transact((tasks) => tasks.push({ id: 'first' }));
+			await store.transact((tasks) => tasks.push({ id: 'second' }));
+			const { tasks } = await store.read();
+			if (tasks.length !== 2) throw new Error('expected two tasks, got ' + tasks.length);
+		})().catch((error) => { console.error(error); process.exit(1); });
+	`;
+	await runNode(script, [modulePath, join(dir, "tasks.json")]);
+});

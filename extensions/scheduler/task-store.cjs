@@ -3,11 +3,25 @@
 const { mkdir, readFile, rename, rm, writeFile } = require("node:fs/promises");
 const { dirname } = require("node:path");
 const { randomUUID } = require("node:crypto");
+const { createRequire } = require("node:module");
 const lockfile = require("proper-lockfile");
+
+// The fs implementation proper-lockfile would use by default.
+const lockfileFs = createRequire(require.resolve("proper-lockfile"))("graceful-fs");
+
+// proper-lockfile caches its mtime precision on the fs object with a non-configurable
+// property. Hosts may hand modules out through a Proxy whose reads do not reflect that
+// write, which breaks a Proxy invariant inside an fs callback and kills the process.
+// Give the library a plain object we own so its cache lands somewhere ordinary.
+function createLockFs(base) {
+	const methods = ["mkdir", "realpath", "rmdir", "rmdirSync", "stat", "utimes"];
+	return Object.fromEntries(methods.map((name) => [name, (...args) => base[name](...args)]));
+}
 
 function createTaskStore(options) {
 	const stateFile = options.stateFile;
 	const sanitize = options.sanitize ?? ((tasks) => tasks);
+	const lockFs = createLockFs(lockfileFs);
 
 	async function readUnlocked() {
 		try {
@@ -43,6 +57,7 @@ function createTaskStore(options) {
 	async function acquireLock(onCompromised) {
 		await mkdir(dirname(stateFile), { recursive: true });
 		return lockfile.lock(stateFile, {
+			fs: lockFs,
 			realpath: false,
 			onCompromised,
 			stale: 10_000,
