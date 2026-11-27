@@ -1,6 +1,6 @@
 {
   "name": "@jl1990/pi-scheduler",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Give Pi coding agents a clock: schedule reminders, shell commands, and self-waking prompts for CI polling and autonomous follow-ups.",
   "author": "jl1990",
   "license": "MIT",
@@ -34,7 +34,7 @@
     "test": "node --test test/*.test.cjs",
     "pack:dry-run": "pnpm pack --dry-run"
   },
-  "packageManager": "pnpm@12.16.1",
+  "packageManager": "pnpm@12.23.0",
   "publishConfig": {
     "access": "public"
   },
@@ -64,7 +64,7 @@
     }
   },
   "dependencies": {
-    "croner": "11.0.0",
+    "croner": "11.0.1",
     "proper-lockfile": "4.1.2"
   },
   "bundleDependencies": [

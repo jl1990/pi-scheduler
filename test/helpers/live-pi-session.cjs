@@ -72,6 +72,7 @@ async function startLivePi() {
 		cwd,
 		agentDir,
 		stateFile,
+		codingAgent,
 		session,
 		runner,
 		tools,

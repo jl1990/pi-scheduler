@@ -84,6 +84,12 @@ test("validateTaskSchedule supports once, interval, and cron", () => {
 	assert.throws(() => validateTaskSchedule("interval", "tomorrow", NOW), /Invalid interval/);
 });
 
+test("validateTaskSchedule rejects malformed tokens instead of interpreting a different cron", () => {
+	for (const schedule of ["0 3* * * * *", "0 0 9 * * SUN6"]) {
+		assert.throws(() => validateTaskSchedule("cron", schedule, NOW), /Invalid cron/);
+	}
+});
+
 test("scheduler core resolves croner when loaded through a preserved symlink", () => {
 	const tmp = mkdtempSync(join(tmpdir(), "pi-scheduler-preserve-symlink-"));
 	try {

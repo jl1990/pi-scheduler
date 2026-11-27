@@ -1,9 +1,57 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+const { until } = require("./helpers/runtime-harness.cjs");
 const { startLivePi } = require("./helpers/live-pi-session.cjs");
 
 const live = process.env.PI_SCHEDULER_LIVE_TESTS === "1";
 const opts = live ? {} : { skip: "set PI_SCHEDULER_LIVE_TESTS=1 to run installed-Pi smoke tests" };
+const queueOpts = process.env.PI_SCHEDULER_QUEUE_TEST === "1" ? opts : {
+	skip: "set PI_SCHEDULER_QUEUE_TEST=1 to test Alt+Up against a Pi build with the queue fix",
+};
+
+test("Alt+Up restores the pending user message without consuming a scheduled shell result", queueOpts, async (t) => {
+	const pi = await startLivePi();
+	try {
+		const { InteractiveMode } = await import(pathToFileURL(path.join(
+			pi.codingAgent, "dist/modes/interactive/interactive-mode.js",
+		)));
+		// Hold the session in the streaming state without calling a model. The
+		// scheduler, Pi's queues, and the Alt+Up action handler are real.
+		t.mock.getter(pi.session, "isStreaming", () => true);
+		t.mock.getter(pi.session, "isIdle", () => false);
+		const typed = "Only this draft should be editable";
+		await pi.session.followUp(typed);
+		const scheduled = await pi.tool("schedule_task").execute("queue-test", {
+			action: "shell", scope: "cwd", schedule: "0.05s", command: "printf scheduled-stdout", wakeOn: "always",
+			followUpPrompt: "Inspect the scheduled output.",
+		}, undefined, undefined);
+		await until(() => JSON.parse(fs.readFileSync(pi.stateFile, "utf8")).tasks
+			.find((task) => task.id === scheduled.details.task.id)?.result?.wakeDisposition === "delivered", "shell wake queued");
+
+		let editorText = "";
+		const ui = Object.assign(Object.create(InteractiveMode.prototype), {
+			compactionQueuedMessages: [],
+			editor: { getText: () => editorText, setText: (text) => { editorText = text; } },
+			updatePendingMessagesDisplay() {},
+			showStatus() {},
+		});
+		Object.defineProperty(ui, "session", { value: pi.session });
+		ui.handleDequeue();
+
+		assert.equal(editorText, typed);
+		assert.equal(pi.session.pendingMessageCount, 0);
+		const queued = pi.session.agent.peekQueuedMessages();
+		assert.equal(queued.length, 1, "the shell wake must still be queued");
+		assert.equal(queued[0].role, "custom");
+		assert.match(queued[0].content, /scheduled-stdout/);
+		assert.match(queued[0].content, /Inspect the scheduled output\./);
+	} finally {
+		await pi.close();
+	}
+});
 
 test("installed Pi loads scheduler and validates the combined tool schema", opts, async () => {
 	const pi = await startLivePi();

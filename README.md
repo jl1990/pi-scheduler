@@ -73,7 +73,7 @@ Use `expiresIn: "2h"` to stop starting new runs after two hours. The absolute de
 
 Backoff applies to every outcome and persists across restarts. Updating the schedule or backoff, or explicitly enabling a task, resets the delay to the base interval. Set `backoff: null` to return to a fixed interval; remove it explicitly when switching to cron or once. Execution limits still count runs normally.
 
-Cron uses `croner`; six-field expressions with seconds are recommended. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
+Cron uses `croner`; six-field expressions with seconds are recommended. Malformed tokens like `3*` or `SUN6` are rejected rather than interpreted as a different schedule. Use `session` scope when a follow-up must return to a specific session. For shared scopes, the process that claims the task receives the follow-up.
 
 ### Shell wake policy
 
@@ -86,6 +86,8 @@ Cron uses `croner`; six-field expressions with seconds are recommended. Use `ses
 | `change` | After the first run, when stdout, stderr, exit status, or killed/timeout state changes |
 
 Use `successPrompt` or `failurePrompt` for outcome-specific instructions, or `followUpPrompt` for either outcome. The wake policy is checked first. Without an explicit policy, supplying a prompt defaults to `always`; otherwise the default is `never`. An explicit matching policy without a custom prompt uses a default review instruction.
+
+On Pi builds that preserve extension messages when editing the user queue, Alt+Up restores only the queued user text. Scheduled prompts and shell wakes stay queued as separate follow-ups. On older Pi versions, the scheduler keeps the original delivery behavior so Alt+Up cannot silently discard a wake.
 
 `change` stores a SHA-256 fingerprint of the complete (untruncated) shell result in task state. The first run establishes the baseline without waking; repeated identical results stay quiet. Editing the command, working directory, or opting into `change` starts a new baseline. If that first run matches `stopOn`, the task stops silently; use `success` or `failure` when the stopping result must wake the agent.
 

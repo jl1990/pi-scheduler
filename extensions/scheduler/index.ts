@@ -1,5 +1,5 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Cron } from "croner";
 import { randomUUID } from "node:crypto";
@@ -59,14 +59,6 @@ function isRunOwnerActive(owner: Record<string, any> | undefined): boolean {
 		return true;
 	} catch (error: any) {
 		return error?.code === "EPERM";
-	}
-}
-
-function sendAgentPrompt(pi: ExtensionAPI, ctx: ExtensionContext, prompt: string): void {
-	if (ctx.isIdle()) {
-		pi.sendUserMessage(prompt);
-	} else {
-		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 	}
 }
 
@@ -387,7 +379,11 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function recordMessage(content: string, details?: Record<string, any>, triggerTurn = false): void {
+	function recordMessage(
+		content: string,
+		details?: Record<string, any>,
+		options: Parameters<ExtensionAPI["sendMessage"]>[1] = { triggerTurn: false },
+	): void {
 		pi.sendMessage(
 			{
 				customType: "scheduled-task",
@@ -395,8 +391,17 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 				display: true,
 				details,
 			},
-			{ triggerTurn },
+			options,
 		);
+	}
+
+	function sendAgentPrompt(ctx: ExtensionContext, prompt: string): void {
+		if ("dequeueUserMessages" in AgentSession.prototype && typeof AgentSession.prototype.dequeueUserMessages === "function") {
+			recordMessage(prompt, undefined, { triggerTurn: true, deliverAs: "followUp" });
+		} else {
+			// Older Pi clears custom follow-ups on Alt+Up. Keep them recoverable as user text.
+			pi.sendUserMessage(prompt, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+		}
 	}
 
 	async function executeTask(
@@ -407,19 +412,19 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 		if (task.action === "notify") {
 			const message = task.message ?? "Scheduled reminder";
 			if (ctx.hasUI) ctx.ui.notify(message, "info");
-			recordMessage(`🔔 ${message}`, { task }, false);
+			recordMessage(`🔔 ${message}`, { task });
 			return { ok: true, delivered: "notify", wakeReason: "notify", wakeDisposition: "not-requested" };
 		}
 
 		if (task.action === "prompt") {
 			const prompt = `${scheduledPromptHeader(task)}${task.prompt}`;
-			sendAgentPrompt(pi, ctx, prompt);
+			sendAgentPrompt(ctx, prompt);
 			return { ok: true, delivered: "prompt", wakeReason: "prompt", wakeDisposition: "delivered" };
 		}
 
 		if (task.action === "message") {
 			const message = task.message ?? "Scheduled message";
-			recordMessage(`⏰ ${message}`, { task }, task.triggerTurn !== false);
+			recordMessage(`⏰ ${message}`, { task }, { triggerTurn: task.triggerTurn !== false });
 			return { ok: true, delivered: "message", triggerTurn: task.triggerTurn !== false, wakeReason: "message", wakeDisposition: task.triggerTurn !== false ? "delivered" : "not-requested" };
 		}
 
@@ -452,7 +457,6 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			recordMessage(
 				`🖥️ Scheduled command ${task.id} finished with exit code ${result.code}: ${task.command}`,
 				{ task, result: shellResult },
-				false,
 			);
 
 			shellResult.wakeReason = task.wakeOn ?? "never";
@@ -557,7 +561,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					result.wakeDisposition = "no-followup";
 					if (instruction) {
 						try {
-							sendAgentPrompt(pi, ctx, shellResultPrompt(wakeTask, result, instruction));
+							sendAgentPrompt(ctx, shellResultPrompt(wakeTask, result, instruction));
 							result.wakeDisposition = "delivered";
 						} catch (error: any) {
 							result.wakeDisposition = "failed";
@@ -596,7 +600,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			if (failedTask && isSessionActive(ctx, generation)) {
 				const message = `Scheduled task ${taskId} failed: ${error?.message ?? String(error)}`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
-				recordMessage(`⚠️ ${message}`, { task: failedTask, error: error?.message ?? String(error) }, false);
+				recordMessage(`⚠️ ${message}`, { task: failedTask, error: error?.message ?? String(error) });
 			}
 		} finally {
 			firing.delete(taskId);
@@ -720,7 +724,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			try {
 				const task = await createAndSchedule(parseCommandTask(args, ctx), ctx);
 				ctx.ui.notify(taskCreatedText(task), "info");
-				recordMessage(taskCreatedText(task), { task }, false);
+				recordMessage(taskCreatedText(task), { task });
 			} catch (error: any) {
 				ctx.ui.notify(error?.message ?? String(error), "error");
 			}
@@ -741,7 +745,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 					ctx,
 				);
 				ctx.ui.notify(taskCreatedText(task), "info");
-				recordMessage(taskCreatedText(task), { task }, false);
+				recordMessage(taskCreatedText(task), { task });
 			} catch (error: any) {
 				ctx.ui.notify(error?.message ?? String(error), "error");
 			}
@@ -756,7 +760,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			const includeAll = view === "all" || view === "history";
 			const includeHistory = view === "history";
 			const visible = visibleTasks(ctx);
-			recordMessage(core.formatTaskList(visible, new Date(), { includeAll, includeHistory }), { includeAll, includeHistory, tasks: visible }, false);
+			recordMessage(core.formatTaskList(visible, new Date(), { includeAll, includeHistory }), { includeAll, includeHistory, tasks: visible });
 			updateStatus(ctx);
 		},
 	});
@@ -772,7 +776,7 @@ export default function schedulerExtension(pi: ExtensionAPI) {
 			try {
 				const task = await mutateVisibleTask(ctx, id, (visible) => core.cancelScheduledTask(visible, id, new Date()));
 				ctx.ui.notify(`Cancelled scheduled task ${task.id}`, "info");
-				recordMessage(`Cancelled scheduled task ${task.id}`, { task }, false);
+				recordMessage(`Cancelled scheduled task ${task.id}`, { task });
 			} catch (error: any) {
 				ctx.ui.notify(error?.message ?? String(error), "error");
 			}

@@ -41,7 +41,7 @@ async function harness(root, exec, sandboxOverrides = {}) {
   const source = stripTypeScriptTypes(readFileSync(path.join(root, 'extensions/scheduler/index.ts'), 'utf8'))
     .replace(/^import .*;\s*$/gm, '')
     .replace('export default function schedulerExtension', 'function schedulerExtension');
-  const events = {}, tools = {}, commands = {}, wakes = [], messages = [];
+  const events = {}, tools = {}, commands = {}, wakes = [], messages = [], userMessages = [];
   const context = {
     cwd: root, hasUI: false, isIdle: () => true,
     sessionManager: {getSessionFile: () => path.join(stateDir, 'session.jsonl')},
@@ -51,14 +51,23 @@ async function harness(root, exec, sandboxOverrides = {}) {
     registerTool: tool => tools[tool.name] = tool,
     registerCommand: (name, command) => commands[name] = command,
     registerMessageRenderer: () => {},
-    sendUserMessage: (text, options) => wakes.push({text, options}),
-    sendMessage: (message, options) => messages.push({message, options}),
+    sendUserMessage: (text, options) => {
+      userMessages.push({text, options});
+      wakes.push({text, options});
+    },
+    sendMessage: (message, options) => {
+      if (options?.triggerTurn && options?.deliverAs === 'followUp') {
+        wakes.push({text: message.content, options});
+      }
+      messages.push({message, options});
+    },
     exec,
   };
   const sandbox = {
     require: localRequire, process: {...process, env: {...process.env, PI_SCHEDULER_STATE_FILE: stateFile}},
     console, setTimeout, clearTimeout, setInterval, clearInterval,
     Cron: localRequire('croner').Cron, randomUUID, homedir: () => stateDir, join: path.join,
+    AgentSession: class { dequeueUserMessages() {} },
     StringEnum: values => ({enum: values}), Text: class {},
     Type: new Proxy({}, {get: (_, key) => value => key === 'Object' ? {properties: value} : value}),
     ...sandboxOverrides,
@@ -69,7 +78,7 @@ async function harness(root, exec, sandboxOverrides = {}) {
   };
   vm.runInNewContext(source + '\nschedulerExtension(pi);', {...sandbox, pi}, {filename: path.join(root, 'extensions/scheduler/index.ts')});
   return {
-    events, tools, commands, wakes, messages, stateFile, context,
+    events, tools, commands, wakes, messages, userMessages, stateFile, context,
     start: () => events.session_start({}, context),
     call: (name, args) => tools[name].execute('test', args, undefined, undefined, context),
     tasks: async () => JSON.parse(await fs.readFile(stateFile, 'utf8')).tasks,

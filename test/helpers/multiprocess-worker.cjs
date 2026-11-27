@@ -44,6 +44,7 @@ const sandbox = {
   console, setTimeout, clearTimeout, setInterval, clearInterval,
   Cron: localRequire("croner").Cron, randomUUID, homedir: () => path.dirname(stateFile), join: path.join,
   StringEnum: (values) => ({ enum: values }), Text: class {},
+  AgentSession: class { dequeueUserMessages() {} },
   Type: new Proxy({}, { get: (_, key) => (value) => key === "Object" ? { properties: value } : value }),
 };
 vm.runInNewContext(source + "\nschedulerExtension(pi);", { ...sandbox, pi }, { filename: path.join(root, "extensions/scheduler/index.ts") });
